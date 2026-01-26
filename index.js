@@ -146,4 +146,8 @@ app.post("/consume", (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
+app.get('/health', (req, res) => {
+  res.send('OK');
+});
+
 app.listen(port, () => console.log("Server on", port));
