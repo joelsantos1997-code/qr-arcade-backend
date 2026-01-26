@@ -150,4 +150,10 @@ app.get('/health', (req, res) => {
   res.send('OK');
 });
 
+// Webhook MercadoPago (recibe notificaciones de pagos)
+app.post('/webhook', (req, res) => {
+  console.log('🔔 WEBHOOK RECEIVED:', JSON.stringify(req.body));
+  res.sendStatus(200);
+});
+
 app.listen(port, () => console.log("Server on", port));
