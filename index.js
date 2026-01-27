@@ -6,32 +6,35 @@ app.use(express.json());
 
 // ===== CONFIG =====
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN; // APP_USR-...
-const BASE_URL = process.env.BASE_URL;               // https://tu-app.onrender.com
-const API_KEY = process.env.API_KEY;                 // clave tuya para el ESP
+const BASE_URL = process.env.BASE_URL;               // https://qr-arcade-backend.onrender.com
+const API_KEY = process.env.API_KEY;                 // tu clave para ESP
 
 if (!MP_ACCESS_TOKEN || !BASE_URL || !API_KEY) {
-  console.error("❌ Faltan env vars: MP_ACCESS_TOKEN, BASE_URL, API_KEY");
+  console.error("Faltan env vars: MP_ACCESS_TOKEN, BASE_URL, API_KEY");
   process.exit(1);
 }
 
-// ===== DB SIMPLE (MVP) =====
-const credits = Object.create(null);
+// ===== DB SIMPLE (MVP en memoria) =====
+const credits = Object.create(null); // { machineId: number }
 function addCredit(machineId, amount = 1) {
   credits[machineId] = (credits[machineId] || 0) + amount;
 }
-function getCredits(machineId) {
-  return credits[machineId] || 0;
-}
 
-// ===== helper fetch MercadoPago =====
+// Para evitar doble crédito por el mismo pago
+const processedPayments = new Set(); // paymentId ya procesado
+
+// Para evitar spamear a MP (rate limit simple)
+const lastPollAt = Object.create(null); // { machineId: timestamp }
+
+// ===== helper fetch =====
 async function mpFetch(url, options = {}) {
   const res = await fetch(url, {
     ...options,
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
-      ...(options.headers || {}),
-    },
+      "Authorization": `Bearer ${MP_ACCESS_TOKEN}`,
+      ...(options.headers || {})
+    }
   });
 
   const text = await res.text();
@@ -40,7 +43,7 @@ async function mpFetch(url, options = {}) {
   return { ok: res.ok, status: res.status, json, text };
 }
 
-// ===== HEALTH =====
+// ===== health =====
 app.get("/", (_, res) => res.send("OK"));
 app.get("/health", (_, res) => res.send("OK"));
 
@@ -49,183 +52,157 @@ app.post("/create_preference", async (req, res) => {
   try {
     const { machineId, price } = req.body;
     if (!machineId || !price) {
-      return res.status(400).json({ ok: false, error: "machineId y price requeridos" });
+      return res.status(400).json({ error: "machineId y price requeridos" });
     }
 
+    // Importante: que el external_reference SIEMPRE empiece por machineId-
     const external_reference = `${machineId}-${Date.now()}`;
 
     const body = {
       items: [{ title: "Credito Arcade", quantity: 1, unit_price: Number(price) }],
       external_reference,
-      notification_url: `${BASE_URL}/mp/webhook`,
+      notification_url: `${BASE_URL}/mp/webhook` // queda listo para cuando MP habilite
     };
 
     const r = await mpFetch("https://api.mercadopago.com/checkout/preferences", {
       method: "POST",
-      body: JSON.stringify(body),
+      body: JSON.stringify(body)
     });
 
     if (!r.ok) {
-      console.error("❌ MP create preference failed:", r.status, r.text);
+      console.error("MP create preference failed:", r.status, r.text);
       return res.status(500).json({
         ok: false,
         error: "Mercado Pago no creó la preferencia",
-        detail: r.json || r.text,
+        detail: r.json || r.text
       });
     }
 
     return res.json({
       ok: true,
       machineId,
-      price: Number(price),
+      price,
       external_reference,
       init_point: r.json.init_point,
-      preference_id: r.json.id,
+      preference_id: r.json.id
     });
   } catch (e) {
-    console.error("❌ create_preference error:", e);
+    console.error("create_preference error:", e);
     return res.status(500).json({ ok: false, error: "Fallo creando preferencia" });
   }
 });
 
-// ===== 2) Webhook Mercado Pago (robusto) =====
+// ===== 2) Webhook MP (lo dejamos, pero Plan A no depende de esto) =====
 app.post("/mp/webhook", async (req, res) => {
-  // Respondemos rápido a MP
+  // Respondemos rápido
   res.sendStatus(200);
 
   try {
-    // MercadoPago puede mandar distintos formatos:
-    // - Query: ?id=...&topic=payment
-    // - Body: { data: { id }, type: "payment" }
-    // - Body: { id, topic }
-    const topic =
-      req.query?.topic ||
-      req.query?.type ||
-      req.body?.type ||
-      req.body?.topic;
-
-    const id =
+    const paymentId =
       req.query?.id ||
       req.body?.data?.id ||
       req.body?.id;
 
-    console.log("🔔 Webhook recibido:", { topic, id });
+    console.log("🔔 /mp/webhook recibido. paymentId =", paymentId, "body=", JSON.stringify(req.body));
 
-    if (!id) {
-      console.log("⚠️ Webhook sin id (ignorado)");
+    if (!paymentId) return;
+    if (processedPayments.has(String(paymentId))) return;
+
+    const r = await mpFetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, { method: "GET" });
+    if (!r.ok) {
+      console.error("MP get payment failed:", r.status, r.text);
       return;
     }
 
-    // Caso 1: topic/type = payment  => consultar pago directo
-    if (topic === "payment" || topic === "payments") {
-      await handlePaymentId(id);
-      return;
+    const pay = r.json;
+    if (pay.status === "approved") {
+      const extRef = pay.external_reference || "";
+      const machineId = extRef.split("-")[0];
+      if (machineId) {
+        processedPayments.add(String(paymentId));
+        addCredit(machineId, 1);
+        console.log("✅ Webhook: Pago aprobado. Crédito +1 para:", machineId, "paymentId:", paymentId);
+      }
     }
-
-    // Caso 2: topic = merchant_order => hay que buscar payments dentro de la orden
-    if (topic === "merchant_order") {
-      await handleMerchantOrderId(id);
-      return;
-    }
-
-    // Caso 3: si no viene topic, intentamos como payment igual (suele funcionar)
-    await handlePaymentId(id);
-
   } catch (e) {
-    console.error("❌ Webhook error:", e);
+    console.error("Webhook error:", e);
   }
 });
 
-async function handlePaymentId(paymentId) {
-  const r = await mpFetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
-    method: "GET",
-  });
+// ===== 3) PLAN A: Polling (buscar pagos aprobados) =====
+// Llamada: GET /mp/poll?machine=arcade1&key=TU_API_KEY
+// - Busca pagos aprobados recientes
+// - Filtra los que tengan external_reference que empiece con "machine-"
+// - Si el paymentId no fue procesado, suma crédito y lo marca
+app.get("/mp/poll", async (req, res) => {
+  try {
+    const { machine, key } = req.query;
+    if (key !== API_KEY) return res.status(401).json({ error: "unauthorized" });
+    if (!machine) return res.status(400).json({ error: "machine requerido" });
 
-  if (!r.ok) {
-    console.error("❌ MP get payment failed:", r.status, r.text);
-    return;
-  }
-
-  const pay = r.json;
-  console.log("💳 Payment:", {
-    id: pay.id,
-    status: pay.status,
-    status_detail: pay.status_detail,
-    external_reference: pay.external_reference,
-  });
-
-  if (pay.status === "approved") {
-    const extRef = pay.external_reference || "";
-    const machineId = extRef.split("-")[0];
-
-    if (machineId) {
-      addCredit(machineId, 1);
-      console.log("✅ Pago aprobado. Crédito +1 para:", machineId, "Total:", getCredits(machineId));
-    } else {
-      console.log("⚠️ Pago aprobado pero extRef sin machineId:", extRef);
+    // rate-limit por máquina (mínimo 2s)
+    const now = Date.now();
+    const last = lastPollAt[machine] || 0;
+    if (now - last < 2000) {
+      return res.json({ ok: true, machine, added: 0, note: "rate_limited" });
     }
-  } else {
-    console.log("ℹ️ Pago no aprobado. Status:", pay.status, pay.status_detail);
-  }
-}
+    lastPollAt[machine] = now;
 
-async function handleMerchantOrderId(orderId) {
-  const r = await mpFetch(`https://api.mercadopago.com/merchant_orders/${orderId}`, {
-    method: "GET",
-  });
+    // Traemos pagos aprobados recientes (últimos 20)
+    const url =
+      "https://api.mercadopago.com/v1/payments/search" +
+      "?sort=date_created&criteria=desc&limit=20&status=approved";
 
-  if (!r.ok) {
-    console.error("❌ MP get merchant_order failed:", r.status, r.text);
-    return;
-  }
-
-  const order = r.json;
-  const payments = Array.isArray(order.payments) ? order.payments : [];
-
-  console.log("🧾 Merchant order:", {
-    id: order.id,
-    payments_count: payments.length,
-  });
-
-  // Buscamos algún pago aprobado dentro de la orden
-  for (const p of payments) {
-    if (p.status === "approved" && p.id) {
-      await handlePaymentId(p.id);
-      return;
+    const r = await mpFetch(url, { method: "GET" });
+    if (!r.ok) {
+      console.error("MP search failed:", r.status, r.text);
+      return res.status(502).json({ ok: false, error: "mp_search_failed", detail: r.json || r.text });
     }
+
+    const results = r.json?.results || [];
+    let added = 0;
+
+    for (const pay of results) {
+      const paymentId = String(pay.id || "");
+      const extRef = String(pay.external_reference || "");
+
+      // Solo pagos que sean de esta máquina
+      if (!extRef.startsWith(`${machine}-`)) continue;
+
+      // Anti-doble: si ya lo procesamos, lo ignoramos
+      if (processedPayments.has(paymentId)) continue;
+
+      processedPayments.add(paymentId);
+      addCredit(machine, 1);
+      added++;
+      console.log("✅ Poll: Pago aprobado detectado. +1 crédito para", machine, "| paymentId:", paymentId, "| extRef:", extRef);
+    }
+
+    return res.json({ ok: true, machine, added, credits: credits[machine] || 0 });
+  } catch (e) {
+    console.error("mp/poll error:", e);
+    return res.status(500).json({ ok: false, error: "poll_failed" });
   }
+});
 
-  console.log("ℹ️ Merchant order sin pagos aprobados todavía.");
-}
-
-// ===== 3) Créditos (ESP) =====
+// ===== 4) Créditos (ESP) =====
 app.get("/credits", (req, res) => {
   const { machine, key } = req.query;
-  if (key !== API_KEY) return res.status(401).json({ ok: false, error: "unauthorized" });
-  return res.json({ ok: true, machine, credits: getCredits(machine) });
+  if (key !== API_KEY) return res.status(401).json({ error: "unauthorized" });
+  return res.json({ machine, credits: credits[machine] || 0 });
 });
 
-// ===== 4) Consumir crédito (ESP) =====
+// ===== 5) Consumir (ESP) =====
 app.post("/consume", (req, res) => {
   const { machine, key } = req.query;
-  if (key !== API_KEY) return res.status(401).json({ ok: false, error: "unauthorized" });
+  if (key !== API_KEY) return res.status(401).json({ error: "unauthorized" });
 
-  const c = getCredits(machine);
+  const c = credits[machine] || 0;
   if (c <= 0) return res.status(409).json({ ok: false, credits: 0 });
 
   credits[machine] = c - 1;
-  return res.json({ ok: true, machine, credits: credits[machine] });
+  return res.json({ ok: true, credits: credits[machine] });
 });
 
 const port = process.env.PORT || 3000;
-// ===== TEST: sumar créditos manualmente (solo para pruebas) =====
-app.post("/test/add", (req, res) => {
-  const { machine, key, amount } = req.query;
-  if (key !== API_KEY) return res.status(401).json({ ok: false, error: "unauthorized" });
-
-  const n = Number(amount || 1);
-  credits[machine] = (credits[machine] || 0) + n;
-  return res.json({ ok: true, machine, credits: credits[machine] });
-});
-
-app.listen(port, () => console.log("✅ Server on", port));
+app.listen(port, () => console.log("Server on", port));
