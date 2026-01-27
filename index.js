@@ -205,4 +205,28 @@ app.post("/consume", (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
+// ===== TEST: agregar créditos manualmente =====
+// POST /test/add?machine=arcade1&amount=1&key=TU_API_KEY
+app.post("/test/add", (req, res) => {
+  const { machine, amount = 1, key } = req.query;
+
+  if (key !== API_KEY) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+
+  if (!machine) {
+    return res.status(400).json({ ok: false, error: "machine requerida" });
+  }
+
+  credits[machine] = (credits[machine] || 0) + Number(amount);
+
+  console.log("🧪 TEST ADD:", machine, "+", amount);
+
+  res.json({
+    ok: true,
+    machine,
+    credits: credits[machine]
+  });
+});
+
 app.listen(port, () => console.log("Server on", port));
