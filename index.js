@@ -218,4 +218,14 @@ app.post("/consume", (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
+// ===== TEST: sumar créditos manualmente (solo para pruebas) =====
+app.post("/test/add", (req, res) => {
+  const { machine, key, amount } = req.query;
+  if (key !== API_KEY) return res.status(401).json({ ok: false, error: "unauthorized" });
+
+  const n = Number(amount || 1);
+  credits[machine] = (credits[machine] || 0) + n;
+  return res.json({ ok: true, machine, credits: credits[machine] });
+});
+
 app.listen(port, () => console.log("✅ Server on", port));
