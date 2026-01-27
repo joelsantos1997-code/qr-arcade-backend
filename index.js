@@ -1,67 +1,112 @@
-import "dotenv/config";
 import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
 // ===== CONFIG =====
-const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN; // APP_USR-...
-const BASE_URL = process.env.BASE_URL;               // https://qr-arcade-backend.onrender.com
-const API_KEY = process.env.API_KEY;                 // tu clave para ESP
+const PORT = process.env.PORT || 10000;
+const BASE_URL = "https://qr-arcade-backend.onrender.com";
+const MP_TOKEN = process.env.MP_ACCESS_TOKEN; // EN RENDER
+const API_KEY = "Laluna123";
 
-if (!MP_ACCESS_TOKEN || !BASE_URL || !API_KEY) {
-  console.error("Faltan env vars: MP_ACCESS_TOKEN, BASE_URL, API_KEY");
-  process.exit(1);
-}
+// ===== MEMORIA SIMPLE (MVP) =====
+const machines = {}; // { arcade1: { credits: 0 } }
 
-// ===== DB SIMPLE (MVP en memoria) =====
-const credits = Object.create(null); // { machineId: number }
-function addCredit(machineId, amount = 1) {
-  credits[machineId] = (credits[machineId] || 0) + amount;
-}
-
-// Para evitar doble crédito por el mismo pago
-const processedPayments = new Set(); // paymentId ya procesado
-
-// Para evitar spamear a MP (rate limit simple)
-const lastPollAt = Object.create(null); // { machineId: timestamp }
-
-// ===== helper fetch =====
+// ===== HELPERS =====
 async function mpFetch(url, options = {}) {
-  const res = await fetch(url, {
+  return fetch(url, {
     ...options,
     headers: {
+      Authorization: `Bearer ${MP_TOKEN}`,
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${MP_ACCESS_TOKEN}`,
       ...(options.headers || {})
     }
-  });
-
-  const text = await res.text();
-  let json = null;
-  try { json = JSON.parse(text); } catch {}
-  return { ok: res.ok, status: res.status, json, text };
+  }).then(async r => ({
+    ok: r.ok,
+    status: r.status,
+    json: await r.json().catch(() => ({}))
+  }));
 }
 
-// ===== health =====
-app.get("/", (_, res) => res.send("OK"));
-app.get("/health", (_, res) => res.send("OK"));
+// ===== HEALTH =====
+app.get("/health", (_, res) => {
+  res.json({ ok: true });
+});
 
-// ===== 1) Crear link de pago (preferencia) =====
-app.post("/create_preference", async (req, res) => {
+// ===== CREDITS =====
+app.get("/credits", (req, res) => {
+  const { machine, key } = req.query;
+  if (key !== API_KEY) return res.status(401).json({ error: "unauthorized" });
+
+  if (!machines[machine]) machines[machine] = { credits: 0 };
+  res.json({ machine, credits: machines[machine].credits });
+});
+
+// ===== CONSUME =====
+app.post("/consume", (req, res) => {
+  const { machine, key } = req.query;
+  if (key !== API_KEY) return res.status(401).json({ error: "unauthorized" });
+
+  if (!machines[machine] || machines[machine].credits <= 0) {
+    return res.status(400).json({ error: "no credits" });
+  }
+
+  machines[machine].credits -= 1;
+  res.json({ ok: true, credits: machines[machine].credits });
+});
+
+// ===== TEST MANUAL (CMD) =====
+app.post("/test/add", (req, res) => {
+  const { machine, amount, key } = req.query;
+  if (key !== API_KEY) return res.status(401).json({ error: "unauthorized" });
+
+  if (!machines[machine]) machines[machine] = { credits: 0 };
+  machines[machine].credits += Number(amount || 1);
+
+  res.json({ ok: true, machine, credits: machines[machine].credits });
+});
+
+// ===== WEBHOOK MP =====
+app.post("/mp/webhook", async (req, res) => {
   try {
-    const { machineId, price } = req.body;
-    if (!machineId || !price) {
-      return res.status(400).json({ error: "machineId y price requeridos" });
-    }
+    const paymentId = req.body?.data?.id;
+    if (!paymentId) return res.sendStatus(200);
 
-    // Importante: que el external_reference SIEMPRE empiece por machineId-
-    const external_reference = `${machineId}-${Date.now()}`;
+    const r = await mpFetch(`https://api.mercadopago.com/v1/payments/${paymentId}`);
+    if (!r.ok) return res.sendStatus(200);
+
+    const p = r.json;
+    if (p.status !== "approved") return res.sendStatus(200);
+
+    const machine = p.external_reference?.split("-")[0];
+    if (!machine) return res.sendStatus(200);
+
+    if (!machines[machine]) machines[machine] = { credits: 0 };
+    machines[machine].credits += 1;
+
+    console.log("✅ Pago aprobado → crédito agregado:", machine);
+    res.sendStatus(200);
+  } catch (e) {
+    console.error("Webhook error:", e);
+    res.sendStatus(200);
+  }
+});
+
+// ===== QR FIJO (SOLUCION IPHONE) =====
+app.get("/pay", async (req, res) => {
+  try {
+    const { machine, price } = req.query;
+    if (!machine || !price) return res.status(400).send("faltan datos");
+
+    const external_reference = `${machine}-${Date.now()}`;
 
     const body = {
-      items: [{ title: "Credito Arcade", quantity: 1, unit_price: Number(price) }],
+      items: [
+        { title: "Credito Arcade", quantity: 1, unit_price: Number(price) }
+      ],
       external_reference,
-      notification_url: `${BASE_URL}/mp/webhook` // queda listo para cuando MP habilite
+      notification_url: `${BASE_URL}/mp/webhook`
     };
 
     const r = await mpFetch("https://api.mercadopago.com/checkout/preferences", {
@@ -69,164 +114,17 @@ app.post("/create_preference", async (req, res) => {
       body: JSON.stringify(body)
     });
 
-    if (!r.ok) {
-      console.error("MP create preference failed:", r.status, r.text);
-      return res.status(500).json({
-        ok: false,
-        error: "Mercado Pago no creó la preferencia",
-        detail: r.json || r.text
-      });
-    }
+    if (!r.ok) return res.status(500).send("MP error");
 
-    return res.json({
-      ok: true,
-      machineId,
-      price,
-      external_reference,
-      init_point: r.json.init_point,
-      preference_id: r.json.id
-    });
+    // 🔥 REDIRECCIONA SIEMPRE A UN LINK NUEVO
+    res.redirect(r.json.init_point);
   } catch (e) {
-    console.error("create_preference error:", e);
-    return res.status(500).json({ ok: false, error: "Fallo creando preferencia" });
+    console.error(e);
+    res.status(500).send("error");
   }
 });
 
-// ===== 2) Webhook MP (lo dejamos, pero Plan A no depende de esto) =====
-app.post("/mp/webhook", async (req, res) => {
-  // Respondemos rápido
-  res.sendStatus(200);
-
-  try {
-    const paymentId =
-      req.query?.id ||
-      req.body?.data?.id ||
-      req.body?.id;
-
-    console.log("🔔 /mp/webhook recibido. paymentId =", paymentId, "body=", JSON.stringify(req.body));
-
-    if (!paymentId) return;
-    if (processedPayments.has(String(paymentId))) return;
-
-    const r = await mpFetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, { method: "GET" });
-    if (!r.ok) {
-      console.error("MP get payment failed:", r.status, r.text);
-      return;
-    }
-
-    const pay = r.json;
-    if (pay.status === "approved") {
-      const extRef = pay.external_reference || "";
-      const machineId = extRef.split("-")[0];
-      if (machineId) {
-        processedPayments.add(String(paymentId));
-        addCredit(machineId, 1);
-        console.log("✅ Webhook: Pago aprobado. Crédito +1 para:", machineId, "paymentId:", paymentId);
-      }
-    }
-  } catch (e) {
-    console.error("Webhook error:", e);
-  }
+// ===== START =====
+app.listen(PORT, () => {
+  console.log("🚀 Server on", PORT);
 });
-
-// ===== 3) PLAN A: Polling (buscar pagos aprobados) =====
-// Llamada: GET /mp/poll?machine=arcade1&key=TU_API_KEY
-// - Busca pagos aprobados recientes
-// - Filtra los que tengan external_reference que empiece con "machine-"
-// - Si el paymentId no fue procesado, suma crédito y lo marca
-app.get("/mp/poll", async (req, res) => {
-  try {
-    const { machine, key } = req.query;
-    if (key !== API_KEY) return res.status(401).json({ error: "unauthorized" });
-    if (!machine) return res.status(400).json({ error: "machine requerido" });
-
-    // rate-limit por máquina (mínimo 2s)
-    const now = Date.now();
-    const last = lastPollAt[machine] || 0;
-    if (now - last < 2000) {
-      return res.json({ ok: true, machine, added: 0, note: "rate_limited" });
-    }
-    lastPollAt[machine] = now;
-
-    // Traemos pagos aprobados recientes (últimos 20)
-    const url =
-      "https://api.mercadopago.com/v1/payments/search" +
-      "?sort=date_created&criteria=desc&limit=20&status=approved";
-
-    const r = await mpFetch(url, { method: "GET" });
-    if (!r.ok) {
-      console.error("MP search failed:", r.status, r.text);
-      return res.status(502).json({ ok: false, error: "mp_search_failed", detail: r.json || r.text });
-    }
-
-    const results = r.json?.results || [];
-    let added = 0;
-
-    for (const pay of results) {
-      const paymentId = String(pay.id || "");
-      const extRef = String(pay.external_reference || "");
-
-      // Solo pagos que sean de esta máquina
-      if (!extRef.startsWith(`${machine}-`)) continue;
-
-      // Anti-doble: si ya lo procesamos, lo ignoramos
-      if (processedPayments.has(paymentId)) continue;
-
-      processedPayments.add(paymentId);
-      addCredit(machine, 1);
-      added++;
-      console.log("✅ Poll: Pago aprobado detectado. +1 crédito para", machine, "| paymentId:", paymentId, "| extRef:", extRef);
-    }
-
-    return res.json({ ok: true, machine, added, credits: credits[machine] || 0 });
-  } catch (e) {
-    console.error("mp/poll error:", e);
-    return res.status(500).json({ ok: false, error: "poll_failed" });
-  }
-});
-
-// ===== 4) Créditos (ESP) =====
-app.get("/credits", (req, res) => {
-  const { machine, key } = req.query;
-  if (key !== API_KEY) return res.status(401).json({ error: "unauthorized" });
-  return res.json({ machine, credits: credits[machine] || 0 });
-});
-
-// ===== 5) Consumir (ESP) =====
-app.post("/consume", (req, res) => {
-  const { machine, key } = req.query;
-  if (key !== API_KEY) return res.status(401).json({ error: "unauthorized" });
-
-  const c = credits[machine] || 0;
-  if (c <= 0) return res.status(409).json({ ok: false, credits: 0 });
-
-  credits[machine] = c - 1;
-  return res.json({ ok: true, credits: credits[machine] });
-});
-
-const port = process.env.PORT || 3000;
-// ===== TEST: agregar créditos manualmente =====
-// POST /test/add?machine=arcade1&amount=1&key=TU_API_KEY
-app.post("/test/add", (req, res) => {
-  const { machine, amount = 1, key } = req.query;
-
-  if (key !== API_KEY) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-
-  if (!machine) {
-    return res.status(400).json({ ok: false, error: "machine requerida" });
-  }
-
-  credits[machine] = (credits[machine] || 0) + Number(amount);
-
-  console.log("🧪 TEST ADD:", machine, "+", amount);
-
-  res.json({
-    ok: true,
-    machine,
-    credits: credits[machine]
-  });
-});
-
-app.listen(port, () => console.log("Server on", port));
