@@ -1,3 +1,4 @@
+```js
 require("dotenv").config();
 
 const express = require("express");
@@ -11,9 +12,9 @@ app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 10000;
 
-const API_KEY = process.env.API_KEY || "Laluna123";
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const API_KEY = (process.env.API_KEY || "Laluna123").trim();
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
+const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 
 let supabase = null;
 
@@ -77,10 +78,15 @@ function fail(res, error, statusCode = 500) {
 
   return res.status(statusCode).json({
     ok: false,
-    error: error.message || String(error)
+    error: error.message || String(error),
+    name: error.name || null,
+    cause: error.cause ? String(error.cause) : null
   });
 }
 
+/**
+ * HOME
+ */
 app.get("/", (req, res) => {
   res.json({
     ok: true,
@@ -88,6 +94,7 @@ app.get("/", (req, res) => {
     status: "online",
     endpoints: [
       "GET /health",
+      "GET /debug/supabase",
       "GET /device/config?device=PS-000001&token=TOKEN-PS-000001-TEST",
       "GET /device/heartbeat?device=PS-000001&token=TOKEN-PS-000001-TEST&rssi=-58&firmware=v1.0",
       "GET /device/bill-pulse?device=PS-000001&token=TOKEN-PS-000001-TEST",
@@ -99,30 +106,39 @@ app.get("/", (req, res) => {
   });
 });
 
+/**
+ * HEALTH
+ */
 app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "paysync-backend",
+    port: PORT,
+    supabase_url_configured: Boolean(SUPABASE_URL),
+    supabase_key_configured: Boolean(SUPABASE_SERVICE_ROLE_KEY),
+    api_key_configured: Boolean(API_KEY)
+  });
+});
+
+/**
+ * DEBUG SUPABASE
+ * Solo para probar conexión.
+ */
 app.get("/debug/supabase", async (req, res) => {
   try {
-    const cleanUrl = (process.env.SUPABASE_URL || "").trim();
-    const hasKey = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY);
-
-    const db = createClient(cleanUrl, process.env.SUPABASE_SERVICE_ROLE_KEY, {
-      auth: {
-        persistSession: false,
-        autoRefreshToken: false
-      }
-    });
+    const db = getSupabase();
 
     const { data, error } = await db
       .from("devices")
       .select("device_code, visible_name, status")
-      .limit(3);
+      .limit(5);
 
     if (error) {
       return res.status(500).json({
         ok: false,
         step: "supabase_query_error",
-        supabase_url: cleanUrl,
-        has_service_key: hasKey,
+        supabase_url: SUPABASE_URL,
+        has_service_key: Boolean(SUPABASE_SERVICE_ROLE_KEY),
         error
       });
     }
@@ -130,8 +146,8 @@ app.get("/debug/supabase", async (req, res) => {
     return res.json({
       ok: true,
       step: "supabase_connected",
-      supabase_url: cleanUrl,
-      has_service_key: hasKey,
+      supabase_url: SUPABASE_URL,
+      has_service_key: Boolean(SUPABASE_SERVICE_ROLE_KEY),
       data
     });
   } catch (err) {
@@ -144,15 +160,6 @@ app.get("/debug/supabase", async (req, res) => {
       stack: err.stack
     });
   }
-});
-  res.json({
-    ok: true,
-    service: "paysync-backend",
-    port: PORT,
-    supabase_url_configured: Boolean(SUPABASE_URL),
-    supabase_key_configured: Boolean(SUPABASE_SERVICE_ROLE_KEY),
-    api_key_configured: Boolean(API_KEY)
-  });
 });
 
 /**
@@ -220,6 +227,7 @@ async function billPulseHandler(req, res) {
   try {
     const deviceCode = getParam(req, ["device", "device_code"]);
     const deviceToken = getParam(req, ["token", "device_token"]);
+
     const eventUid =
       getParam(req, ["event_uid", "event"]) ||
       `${deviceCode}-bill-${Date.now()}-${Math.floor(Math.random() * 999999)}`;
@@ -321,7 +329,7 @@ app.get("/device/summary", async (req, res) => {
 
 /**
  * Test manual: simula pago QR aprobado.
- * Esto después se reemplaza por Mercado Pago real.
+ * Después esto lo reemplazamos por Mercado Pago real.
  */
 async function testQrApprovedHandler(req, res) {
   try {
@@ -330,6 +338,7 @@ async function testQrApprovedHandler(req, res) {
     }
 
     const deviceCode = getParam(req, ["device", "device_code"], "PS-000001");
+
     const paymentId =
       getParam(req, ["payment", "payment_id", "mp_payment_id"]) ||
       `MP-TEST-${Date.now()}`;
@@ -358,6 +367,10 @@ async function testQrApprovedHandler(req, res) {
 app.get("/test/qr-approved", testQrApprovedHandler);
 app.post("/test/qr-approved", testQrApprovedHandler);
 
+/**
+ * START SERVER
+ */
 app.listen(PORT, () => {
   console.log(`✅ PaySync backend running on port ${PORT}`);
 });
+```
