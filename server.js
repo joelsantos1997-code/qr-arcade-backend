@@ -2,7 +2,6 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
-const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 
@@ -12,28 +11,17 @@ app.use(express.json({ limit: "1mb" }));
 const PORT = process.env.PORT || 10000;
 
 const API_KEY = (process.env.API_KEY || "Laluna123").trim();
-const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
+const SUPABASE_URL_RAW = (process.env.SUPABASE_URL || "").trim();
 const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 
-let supabase = null;
-
-if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
-supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-auth: {
-persistSession: false,
-autoRefreshToken: false
-}
-});
-} else {
-console.warn("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+function cleanSupabaseUrl(url) {
+return String(url || "")
+.trim()
+.replace(//rest/v1/?$/i, "")
+.replace(//$/, "");
 }
 
-function getSupabase() {
-if (!supabase) {
-throw new Error("Supabase is not configured. Check Render Environment Variables.");
-}
-return supabase;
-}
+const SUPABASE_URL = cleanSupabaseUrl(SUPABASE_URL_RAW);
 
 function getParam(req, names, fallback) {
 if (fallback === undefined) {
@@ -69,18 +57,6 @@ req.query.key ||
 return key === API_KEY;
 }
 
-async function callRpc(functionName, params) {
-const db = getSupabase();
-
-const result = await db.rpc(functionName, params);
-
-if (result.error) {
-throw result.error;
-}
-
-return result.data;
-}
-
 function ok(res, data) {
 if (data === undefined) {
 data = {};
@@ -107,11 +83,61 @@ cause: error.cause ? String(error.cause) : null
 });
 }
 
+function supabaseHeaders() {
+return {
+apikey: SUPABASE_SERVICE_ROLE_KEY,
+Authorization: "Bearer " + SUPABASE_SERVICE_ROLE_KEY,
+"Content-Type": "application/json"
+};
+}
+
+async function supabaseRequest(path, options) {
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+throw new Error("Supabase is not configured. Check Render Environment Variables.");
+}
+
+if (!options) {
+options = {};
+}
+
+const url = SUPABASE_URL + path;
+
+const response = await fetch(url, {
+method: options.method || "GET",
+headers: supabaseHeaders(),
+body: options.body || undefined
+});
+
+const text = await response.text();
+
+let data = null;
+
+try {
+data = text ? JSON.parse(text) : null;
+} catch (e) {
+data = text;
+}
+
+if (!response.ok) {
+throw new Error("Supabase HTTP " + response.status + ": " + text);
+}
+
+return data;
+}
+
+async function callRpc(functionName, params) {
+return await supabaseRequest("/rest/v1/rpc/" + functionName, {
+method: "POST",
+body: JSON.stringify(params || {})
+});
+}
+
 app.get("/", function (req, res) {
 res.json({
 ok: true,
 name: "PaySync Backend",
 status: "online",
+mode: "supabase-rest",
 endpoints: [
 "GET /health",
 "GET /debug/supabase",
@@ -133,36 +159,24 @@ service: "paysync-backend",
 port: PORT,
 supabase_url_configured: Boolean(SUPABASE_URL),
 supabase_key_configured: Boolean(SUPABASE_SERVICE_ROLE_KEY),
-api_key_configured: Boolean(API_KEY)
+api_key_configured: Boolean(API_KEY),
+supabase_url: SUPABASE_URL
 });
 });
 
 app.get("/debug/supabase", async function (req, res) {
 try {
-const db = getSupabase();
+const data = await supabaseRequest(
+"/rest/v1/devices?select=device_code,visible_name,status&limit=5"
+);
 
 ```
-const result = await db
-  .from("devices")
-  .select("device_code, visible_name, status")
-  .limit(5);
-
-if (result.error) {
-  return res.status(500).json({
-    ok: false,
-    step: "supabase_query_error",
-    supabase_url: SUPABASE_URL,
-    has_service_key: Boolean(SUPABASE_SERVICE_ROLE_KEY),
-    error: result.error
-  });
-}
-
 return res.json({
   ok: true,
   step: "supabase_connected",
   supabase_url: SUPABASE_URL,
   has_service_key: Boolean(SUPABASE_SERVICE_ROLE_KEY),
-  data: result.data
+  data: data
 });
 ```
 
@@ -308,21 +322,15 @@ try {
 const deviceCode = getParam(req, ["device", "device_code"]);
 
 ```
-let query = getSupabase()
-  .from("device_live_status")
-  .select("*");
+let path = "/rest/v1/device_live_status?select=*";
 
 if (deviceCode) {
-  query = query.eq("device_code", deviceCode);
+  path = path + "&device_code=eq." + encodeURIComponent(deviceCode);
 }
 
-const result = await query;
+const data = await supabaseRequest(path);
 
-if (result.error) {
-  throw result.error;
-}
-
-return ok(res, result.data);
+return ok(res, data);
 ```
 
 } catch (error) {
@@ -335,21 +343,15 @@ try {
 const deviceCode = getParam(req, ["device", "device_code"]);
 
 ```
-let query = getSupabase()
-  .from("device_dashboard_summary")
-  .select("*");
+let path = "/rest/v1/device_dashboard_summary?select=*";
 
 if (deviceCode) {
-  query = query.eq("device_code", deviceCode);
+  path = path + "&device_code=eq." + encodeURIComponent(deviceCode);
 }
 
-const result = await query;
+const data = await supabaseRequest(path);
 
-if (result.error) {
-  throw result.error;
-}
-
-return ok(res, result.data);
+return ok(res, data);
 ```
 
 } catch (error) {
