@@ -1,7 +1,7 @@
 {
   "name": "paysync-backend",
   "version": "1.0.0",
-  "description": "PaySync backend for arcade QR payments, bill pulses and device monitoring",
+  "description": "PaySync backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
