@@ -100,6 +100,51 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
+app.get("/debug/supabase", async (req, res) => {
+  try {
+    const cleanUrl = (process.env.SUPABASE_URL || "").trim();
+    const hasKey = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+    const db = createClient(cleanUrl, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false
+      }
+    });
+
+    const { data, error } = await db
+      .from("devices")
+      .select("device_code, visible_name, status")
+      .limit(3);
+
+    if (error) {
+      return res.status(500).json({
+        ok: false,
+        step: "supabase_query_error",
+        supabase_url: cleanUrl,
+        has_service_key: hasKey,
+        error
+      });
+    }
+
+    return res.json({
+      ok: true,
+      step: "supabase_connected",
+      supabase_url: cleanUrl,
+      has_service_key: hasKey,
+      data
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      step: "catch_error",
+      message: err.message,
+      name: err.name,
+      cause: err.cause ? String(err.cause) : null,
+      stack: err.stack
+    });
+  }
+});
   res.json({
     ok: true,
     service: "paysync-backend",
