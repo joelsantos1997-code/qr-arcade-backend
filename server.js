@@ -32,15 +32,29 @@ function getSupabase() {
 if (!supabase) {
 throw new Error("Supabase is not configured. Check Render Environment Variables.");
 }
-
 return supabase;
 }
 
-function getParam(req, names, fallback = null) {
+function getParam(req, names, fallback) {
+if (fallback === undefined) {
+fallback = null;
+}
+
 for (const name of names) {
-if (req.body && req.body[name] !== undefined) return req.body[name];
-if (req.query && req.query[name] !== undefined) return req.query[name];
-if (req.params && req.params[name] !== undefined) return req.params[name];
+if (req.body && req.body[name] !== undefined) {
+return req.body[name];
+}
+
+```
+if (req.query && req.query[name] !== undefined) {
+  return req.query[name];
+}
+
+if (req.params && req.params[name] !== undefined) {
+  return req.params[name];
+}
+```
+
 }
 
 return fallback;
@@ -58,23 +72,31 @@ return key === API_KEY;
 async function callRpc(functionName, params) {
 const db = getSupabase();
 
-const { data, error } = await db.rpc(functionName, params);
+const result = await db.rpc(functionName, params);
 
-if (error) {
-throw error;
+if (result.error) {
+throw result.error;
 }
 
-return data;
+return result.data;
 }
 
-function ok(res, data = {}) {
+function ok(res, data) {
+if (data === undefined) {
+data = {};
+}
+
 return res.json({
 ok: true,
-data
+data: data
 });
 }
 
-function fail(res, error, statusCode = 500) {
+function fail(res, error, statusCode) {
+if (statusCode === undefined) {
+statusCode = 500;
+}
+
 console.error("ERROR:", error);
 
 return res.status(statusCode).json({
@@ -85,7 +107,7 @@ cause: error.cause ? String(error.cause) : null
 });
 }
 
-app.get("/", (req, res) => {
+app.get("/", function (req, res) {
 res.json({
 ok: true,
 name: "PaySync Backend",
@@ -104,7 +126,7 @@ endpoints: [
 });
 });
 
-app.get("/health", (req, res) => {
+app.get("/health", function (req, res) {
 res.json({
 ok: true,
 service: "paysync-backend",
@@ -115,23 +137,23 @@ api_key_configured: Boolean(API_KEY)
 });
 });
 
-app.get("/debug/supabase", async (req, res) => {
+app.get("/debug/supabase", async function (req, res) {
 try {
 const db = getSupabase();
 
 ```
-const { data, error } = await db
+const result = await db
   .from("devices")
   .select("device_code, visible_name, status")
   .limit(5);
 
-if (error) {
+if (result.error) {
   return res.status(500).json({
     ok: false,
     step: "supabase_query_error",
     supabase_url: SUPABASE_URL,
     has_service_key: Boolean(SUPABASE_SERVICE_ROLE_KEY),
-    error
+    error: result.error
   });
 }
 
@@ -140,7 +162,7 @@ return res.json({
   step: "supabase_connected",
   supabase_url: SUPABASE_URL,
   has_service_key: Boolean(SUPABASE_SERVICE_ROLE_KEY),
-  data
+  data: result.data
 });
 ```
 
@@ -193,7 +215,11 @@ if (!deviceCode || !deviceToken) {
   return fail(res, new Error("Missing device/device_code or token/device_token"), 400);
 }
 
-const wifiRssi = rssiRaw !== null ? parseInt(rssiRaw, 10) : null;
+let wifiRssi = null;
+
+if (rssiRaw !== null) {
+  wifiRssi = parseInt(rssiRaw, 10);
+}
 
 const data = await callRpc("device_heartbeat_by_device_code", {
   p_device_code: deviceCode,
@@ -219,12 +245,19 @@ const deviceCode = getParam(req, ["device", "device_code"]);
 const deviceToken = getParam(req, ["token", "device_token"]);
 
 ```
-const eventUid =
-  getParam(req, ["event_uid", "event"]) ||
-  `${deviceCode}-bill-${Date.now()}-${Math.floor(Math.random() * 999999)}`;
+let eventUid = getParam(req, ["event_uid", "event"]);
 
 if (!deviceCode || !deviceToken) {
   return fail(res, new Error("Missing device/device_code or token/device_token"), 400);
+}
+
+if (!eventUid) {
+  eventUid =
+    deviceCode +
+    "-bill-" +
+    Date.now() +
+    "-" +
+    Math.floor(Math.random() * 999999);
 }
 
 const data = await callRpc("register_bill_pulse_by_device_code", {
@@ -270,7 +303,7 @@ return fail(res, error);
 app.get("/device/consume-pulse", consumePulseHandler);
 app.post("/device/consume-pulse", consumePulseHandler);
 
-app.get("/device/live-status", async (req, res) => {
+app.get("/device/live-status", async function (req, res) {
 try {
 const deviceCode = getParam(req, ["device", "device_code"]);
 
@@ -283,13 +316,13 @@ if (deviceCode) {
   query = query.eq("device_code", deviceCode);
 }
 
-const { data, error } = await query;
+const result = await query;
 
-if (error) {
-  throw error;
+if (result.error) {
+  throw result.error;
 }
 
-return ok(res, data);
+return ok(res, result.data);
 ```
 
 } catch (error) {
@@ -297,7 +330,7 @@ return fail(res, error);
 }
 });
 
-app.get("/device/summary", async (req, res) => {
+app.get("/device/summary", async function (req, res) {
 try {
 const deviceCode = getParam(req, ["device", "device_code"]);
 
@@ -310,13 +343,13 @@ if (deviceCode) {
   query = query.eq("device_code", deviceCode);
 }
 
-const { data, error } = await query;
+const result = await query;
 
-if (error) {
-  throw error;
+if (result.error) {
+  throw result.error;
 }
 
-return ok(res, data);
+return ok(res, result.data);
 ```
 
 } catch (error) {
@@ -333,17 +366,21 @@ return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
 ```
 const deviceCode = getParam(req, ["device", "device_code"], "PS-000001");
 
-const paymentId =
-  getParam(req, ["payment", "payment_id", "mp_payment_id"]) ||
-  `MP-TEST-${Date.now()}`;
+let paymentId = getParam(req, ["payment", "payment_id", "mp_payment_id"]);
+let preferenceId = getParam(req, ["preference", "preference_id", "mp_preference_id"]);
+let externalReference = getParam(req, ["external_reference"]);
 
-const preferenceId =
-  getParam(req, ["preference", "preference_id", "mp_preference_id"]) ||
-  `PREF-TEST-${Date.now()}`;
+if (!paymentId) {
+  paymentId = "MP-TEST-" + Date.now();
+}
 
-const externalReference =
-  getParam(req, ["external_reference"]) ||
-  `${deviceCode}-${paymentId}`;
+if (!preferenceId) {
+  preferenceId = "PREF-TEST-" + Date.now();
+}
+
+if (!externalReference) {
+  externalReference = deviceCode + "-" + paymentId;
+}
 
 const data = await callRpc("register_qr_payment_by_device_code", {
   p_device_code: deviceCode,
@@ -363,6 +400,6 @@ return fail(res, error);
 app.get("/test/qr-approved", testQrApprovedHandler);
 app.post("/test/qr-approved", testQrApprovedHandler);
 
-app.listen(PORT, () => {
-console.log(`PaySync backend running on port ${PORT}`);
+app.listen(PORT, function () {
+console.log("PaySync backend running on port " + PORT);
 });
