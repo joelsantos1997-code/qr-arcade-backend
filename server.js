@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 10000;
 const API_KEY = String(process.env.API_KEY || "Laluna123").trim();
 
 // URL fija de Supabase para evitar errores de variable o caracteres ocultos
-let SUPABASE_URL = "https://pwfmcyufkslcazqurprwr.supabase.co";
+let SUPABASE_URL = "https://lrsladmyfriundetnnjw.supabase.co";
 
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 
