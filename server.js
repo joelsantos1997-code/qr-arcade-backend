@@ -11,7 +11,10 @@ app.use(express.json({ limit: "1mb" }));
 const PORT = process.env.PORT || 10000;
 
 const API_KEY = String(process.env.API_KEY || "Laluna123").trim();
-let SUPABASE_URL = String(process.env.SUPABASE_URL || "").trim();
+
+// URL fija de Supabase para evitar errores de variable o caracteres ocultos
+let SUPABASE_URL = "https://pwfmcyufkslcazqurprwr.supabase.co";
+
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 
 if (SUPABASE_URL.endsWith("/rest/v1/")) {
