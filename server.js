@@ -367,6 +367,30 @@ async function testQrApprovedHandler(req, res) {
 
 app.get("/test/qr-approved", testQrApprovedHandler);
 app.post("/test/qr-approved", testQrApprovedHandler);
+async function registerCollectionHandler(req, res) {
+  try {
+    const deviceCode = getParam(req, ["device", "device_code"]);
+    const deviceToken = getParam(req, ["token", "device_token"]);
+    const notes = getParam(req, ["notes"], "Recaudacion registrada desde PaySync");
+
+    if (!deviceCode || !deviceToken) {
+      return fail(res, new Error("Missing device or token"), 400);
+    }
+
+    const data = await callRpc("register_collection_by_device_code_secure", {
+      p_device_code: deviceCode,
+      p_device_token: deviceToken,
+      p_notes: notes
+    });
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/device/register-collection", registerCollectionHandler);
+app.post("/device/register-collection", registerCollectionHandler);
 
 app.listen(PORT, function () {
   console.log("PaySync backend running on port " + PORT);
