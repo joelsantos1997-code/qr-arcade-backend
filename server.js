@@ -11,6 +11,7 @@ app.use(express.json({ limit: "1mb" }));
 const PORT = process.env.PORT || 10000;
 
 const API_KEY = String(process.env.API_KEY || "Laluna123").trim();
+const MP_ACCESS_TOKEN = String(process.env.MP_ACCESS_TOKEN || "").trim();
 
 let SUPABASE_URL = String(
   process.env.SUPABASE_URL || "https://lrsladmyfriundetnnjw.supabase.co/rest/v1/"
@@ -62,8 +63,16 @@ function escapeHtml(value) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
+    .replace(/\"/g, "&quot;")
     .replace(/'/g, "&#039;");
+}
+
+function getPublicBaseUrl(req) {
+  if (process.env.PUBLIC_BASE_URL) {
+    return String(process.env.PUBLIC_BASE_URL).replace(/\/$/, "");
+  }
+
+  return "https://" + req.get("host");
 }
 
 function checkApiKey(req) {
@@ -147,6 +156,74 @@ async function callRpc(functionName, params) {
   );
 }
 
+async function mercadoPagoRequest(path, method, bodyObject) {
+  if (!MP_ACCESS_TOKEN) {
+    throw new Error("MP_ACCESS_TOKEN is not configured in Vercel.");
+  }
+
+  const options = {
+    method: method || "GET",
+    headers: {
+      Authorization: "Bearer " + MP_ACCESS_TOKEN,
+      "Content-Type": "application/json"
+    }
+  };
+
+  if (bodyObject !== undefined && bodyObject !== null) {
+    options.body = JSON.stringify(bodyObject);
+  }
+
+  const response = await fetch("https://api.mercadopago.com" + path, options);
+  const text = await response.text();
+
+  let data = null;
+
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch (e) {
+    data = text;
+  }
+
+  if (!response.ok) {
+    throw new Error("Mercado Pago HTTP " + response.status + ": " + text);
+  }
+
+  return data;
+}
+
+async function getDeviceFromSummary(deviceCode) {
+  const normalizedCode = normalizeDeviceCode(deviceCode);
+  const path =
+    "/rest/v1/device_dashboard_summary?select=*&device_code=eq." +
+    encodeURIComponent(normalizedCode);
+
+  const data = await supabaseRequest(path, "GET");
+
+  if (!data || !Array.isArray(data) || data.length === 0) {
+    return null;
+  }
+
+  return data[0];
+}
+
+function paymentStatusPage(title, message, deviceCode) {
+  return (
+    "<html>" +
+      "<head>" +
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0' />" +
+        "<title>PaySync</title>" +
+      "</head>" +
+      "<body style='font-family:Arial;background:#080b12;color:white;margin:0;padding:30px;text-align:center;'>" +
+        "<div style='max-width:420px;margin:auto;background:#111827;border:1px solid #263244;border-radius:20px;padding:24px;'>" +
+          "<h1 style='color:#16d9ff;'>" + escapeHtml(title) + "</h1>" +
+          "<p style='color:#cbd5e1;'>" + escapeHtml(message) + "</p>" +
+          "<p style='font-size:14px;color:#94a3b8;'>Codigo: " + escapeHtml(deviceCode || "") + "</p>" +
+        "</div>" +
+      "</body>" +
+    "</html>"
+  );
+}
+
 app.get("/", function (req, res) {
   return res.json({
     ok: true,
@@ -154,6 +231,7 @@ app.get("/", function (req, res) {
     status: "online",
     service: "paysync-backend",
     supabase_url: SUPABASE_URL,
+    mercado_pago_configured: Boolean(MP_ACCESS_TOKEN),
     endpoints: [
       "GET /health",
       "GET /debug/supabase",
@@ -169,8 +247,9 @@ app.get("/", function (req, res) {
       "GET /company/activate-plan",
       "GET /admin/create-devices-batch",
       "GET /admin/print-qr",
-      "GET /test/qr-approved",
-      "GET /pay/:device_code"
+      "GET /pay/:device_code",
+      "GET /pay/start/:device_code",
+      "POST /mp/webhook"
     ]
   });
 });
@@ -183,6 +262,7 @@ app.get("/health", function (req, res) {
     supabase_url_configured: Boolean(SUPABASE_URL),
     supabase_key_configured: Boolean(SUPABASE_SERVICE_ROLE_KEY),
     api_key_configured: Boolean(API_KEY),
+    mercado_pago_configured: Boolean(MP_ACCESS_TOKEN),
     supabase_url: SUPABASE_URL
   });
 });
@@ -590,7 +670,7 @@ app.get("/admin/print-qr", async function (req, res) {
 
     const devices = await supabaseRequest(path, "GET");
 
-    const publicBaseUrl = "https://" + req.get("host");
+    const publicBaseUrl = getPublicBaseUrl(req);
 
     let cardsHtml = "";
 
@@ -661,7 +741,7 @@ app.get("/admin/print-qr", async function (req, res) {
           "<div class='top'>" +
             "<h1>PaySync - QR imprimibles</h1>" +
             "<p>Total de dispositivos mostrados: <b>" + devices.length + "</b></p>" +
-            "<p>Tip: podés filtrar por rango usando <b>?from=4&to=8&key=Laluna123</b></p>" +
+            "<p>Tip: podes filtrar por rango usando <b>?from=4&to=8&key=Laluna123</b></p>" +
             "<div class='actions'>" +
               "<button class='btn' onclick='window.print()'>Imprimir / Guardar PDF</button>" +
             "</div>" +
@@ -677,28 +757,220 @@ app.get("/admin/print-qr", async function (req, res) {
   }
 });
 
+app.get("/pay/start/:device_code", async function (req, res) {
+  try {
+    const deviceCode = normalizeDeviceCode(getParam(req, ["device_code"]));
+    const device = await getDeviceFromSummary(deviceCode);
+
+    if (!device) {
+      return res.status(404).send(paymentStatusPage(
+        "Dispositivo no encontrado",
+        "El codigo no existe en PaySync.",
+        deviceCode
+      ));
+    }
+
+    if (device.status !== "active") {
+      return res.status(403).send(paymentStatusPage(
+        "Dispositivo no disponible",
+        "Esta maquina no esta activa o tiene el plan vencido.",
+        deviceCode
+      ));
+    }
+
+    const amount = Number(device.qr_price_ars || 0);
+
+    if (!amount || amount <= 0) {
+      return fail(res, new Error("Invalid QR price for device"), 400);
+    }
+
+    const publicBaseUrl = getPublicBaseUrl(req);
+    const externalReference = device.device_code + "|" + Date.now();
+
+    const preference = await mercadoPagoRequest(
+      "/checkout/preferences",
+      "POST",
+      {
+        items: [
+          {
+            title: "Credito PaySync - " + device.visible_name,
+            description: "Maquina " + device.device_code,
+            quantity: 1,
+            currency_id: "ARS",
+            unit_price: amount
+          }
+        ],
+        external_reference: externalReference,
+        metadata: {
+          device_code: device.device_code,
+          source: "paysync"
+        },
+        notification_url: publicBaseUrl + "/mp/webhook",
+        back_urls: {
+          success: publicBaseUrl + "/pay/success?device=" + encodeURIComponent(device.device_code),
+          failure: publicBaseUrl + "/pay/failure?device=" + encodeURIComponent(device.device_code),
+          pending: publicBaseUrl + "/pay/pending?device=" + encodeURIComponent(device.device_code)
+        },
+        auto_return: "approved"
+      }
+    );
+
+    const checkoutUrl = preference.init_point || preference.sandbox_init_point;
+
+    if (!checkoutUrl) {
+      return fail(res, new Error("Mercado Pago did not return init_point"), 500);
+    }
+
+    if (getParam(req, ["json"], "0") === "1") {
+      return ok(res, {
+        device_code: device.device_code,
+        amount: amount,
+        preference_id: preference.id,
+        checkout_url: checkoutUrl,
+        external_reference: externalReference
+      });
+    }
+
+    return res.redirect(checkoutUrl);
+  } catch (error) {
+    return fail(res, error);
+  }
+});
+
+async function mercadoPagoWebhookHandler(req, res) {
+  try {
+    const body = req.body || {};
+    const query = req.query || {};
+
+    const paymentId =
+      (body.data && body.data.id) ||
+      body.id ||
+      query["data.id"] ||
+      query.id ||
+      query.payment_id ||
+      null;
+
+    if (!paymentId) {
+      return ok(res, {
+        message: "Webhook recibido sin paymentId",
+        query: query,
+        body: body
+      });
+    }
+
+    const payment = await mercadoPagoRequest(
+      "/v1/payments/" + encodeURIComponent(paymentId),
+      "GET"
+    );
+
+    const paymentStatus = String(payment.status || "");
+
+    if (paymentStatus !== "approved") {
+      return ok(res, {
+        message: "Pago recibido pero no aprobado",
+        payment_id: paymentId,
+        status: paymentStatus
+      });
+    }
+
+    const existing = await supabaseRequest(
+      "/rest/v1/qr_payments?select=id,mp_payment_id&mp_payment_id=eq." +
+        encodeURIComponent(String(payment.id)) +
+        "&limit=1",
+      "GET"
+    );
+
+    if (existing && Array.isArray(existing) && existing.length > 0) {
+      return ok(res, {
+        message: "Pago ya registrado anteriormente",
+        payment_id: payment.id
+      });
+    }
+
+    const metadata = payment.metadata || {};
+    const externalReference = String(payment.external_reference || "");
+
+    let deviceCode =
+      metadata.device_code ||
+      metadata.deviceCode ||
+      externalReference.split("|")[0] ||
+      "";
+
+    deviceCode = normalizeDeviceCode(deviceCode);
+
+    if (!deviceCode || deviceCode === "PS-000000") {
+      return fail(res, new Error("Payment approved but device_code was not found"), 400);
+    }
+
+    const preferenceId = String(
+      payment.preference_id ||
+      (payment.order && payment.order.id) ||
+      "PREF-" + payment.id
+    );
+
+    const data = await callRpc("register_qr_payment_by_device_code", {
+      p_device_code: deviceCode,
+      p_mp_payment_id: String(payment.id),
+      p_mp_preference_id: preferenceId,
+      p_external_reference: externalReference || deviceCode + "-" + payment.id
+    });
+
+    return ok(res, {
+      message: "Pago aprobado registrado en PaySync",
+      payment_id: payment.id,
+      device_code: deviceCode,
+      result: data
+    });
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.post("/mp/webhook", mercadoPagoWebhookHandler);
+app.get("/mp/webhook", mercadoPagoWebhookHandler);
+
+app.get("/pay/success", function (req, res) {
+  const deviceCode = getParam(req, ["device"], "");
+  return res.send(paymentStatusPage(
+    "Pago aprobado",
+    "Listo. Si la maquina esta online, el credito se va a entregar automaticamente.",
+    deviceCode
+  ));
+});
+
+app.get("/pay/failure", function (req, res) {
+  const deviceCode = getParam(req, ["device"], "");
+  return res.send(paymentStatusPage(
+    "Pago rechazado",
+    "No se pudo completar el pago. Podes volver a escanear el QR e intentar otra vez.",
+    deviceCode
+  ));
+});
+
+app.get("/pay/pending", function (req, res) {
+  const deviceCode = getParam(req, ["device"], "");
+  return res.send(paymentStatusPage(
+    "Pago pendiente",
+    "Mercado Pago todavia esta procesando el pago. Cuando se apruebe, PaySync entregara el credito.",
+    deviceCode
+  ));
+});
+
 app.get("/pay/:device_code", async function (req, res) {
   try {
-    const deviceCode = getParam(req, ["device_code"]);
+    const deviceCode = normalizeDeviceCode(getParam(req, ["device_code"]));
+    const device = await getDeviceFromSummary(deviceCode);
 
-    const path =
-      "/rest/v1/device_dashboard_summary?select=*&device_code=eq." +
-      encodeURIComponent(deviceCode);
-
-    const data = await supabaseRequest(path, "GET");
-
-    if (!data || !Array.isArray(data) || data.length === 0) {
+    if (!device) {
       return res.status(404).send(
         "<html>" +
           "<body style='font-family: Arial; background:#080b12; color:white; text-align:center; padding:40px;'>" +
             "<h1>Dispositivo no encontrado</h1>" +
-            "<p>El codigo " + deviceCode + " no existe en PaySync.</p>" +
+            "<p>El codigo " + escapeHtml(deviceCode) + " no existe en PaySync.</p>" +
           "</body>" +
         "</html>"
       );
     }
-
-    const device = data[0];
 
     if (device.status !== "active") {
       return res.status(403).send(
@@ -706,7 +978,7 @@ app.get("/pay/:device_code", async function (req, res) {
           "<body style='font-family: Arial; background:#080b12; color:white; text-align:center; padding:40px;'>" +
             "<h1>Dispositivo no disponible</h1>" +
             "<p>Esta maquina no esta activa o tiene el plan vencido.</p>" +
-            "<p>Codigo: " + deviceCode + "</p>" +
+            "<p>Codigo: " + escapeHtml(deviceCode) + "</p>" +
           "</body>" +
         "</html>"
       );
@@ -716,16 +988,16 @@ app.get("/pay/:device_code", async function (req, res) {
       "<html>" +
         "<head>" +
           "<meta name='viewport' content='width=device-width, initial-scale=1.0' />" +
-          "<title>PaySync - " + device.visible_name + "</title>" +
+          "<title>PaySync - " + escapeHtml(device.visible_name) + "</title>" +
         "</head>" +
         "<body style='font-family: Arial; background:#080b12; color:white; margin:0; padding:30px;'>" +
           "<div style='max-width:420px; margin:auto; background:#111827; border:1px solid #263244; border-radius:20px; padding:24px; text-align:center;'>" +
             "<h1 style='color:#16d9ff; margin-top:0;'>PaySync</h1>" +
-            "<h2>" + device.visible_name + "</h2>" +
+            "<h2>" + escapeHtml(device.visible_name) + "</h2>" +
             "<p style='color:#9ca3af;'>Confirma que esta es la maquina en la que queres jugar</p>" +
-            "<p style='font-size:14px; color:#9ca3af;'>Codigo: " + device.device_code + "</p>" +
-            "<p style='font-size:34px; font-weight:bold;'>$" + device.qr_price_ars + "</p>" +
-            "<a href='https://link.mercadopago.com/paysync-mensual' " +
+            "<p style='font-size:14px; color:#9ca3af;'>Codigo: " + escapeHtml(device.device_code) + "</p>" +
+            "<p style='font-size:34px; font-weight:bold;'>$" + escapeHtml(device.qr_price_ars) + "</p>" +
+            "<a href='/pay/start/" + encodeURIComponent(device.device_code) + "' " +
               "style='display:block; background:#06c8f4; color:#001018; padding:16px; border-radius:14px; text-decoration:none; font-weight:bold; margin-top:20px;'>" +
               "Pagar ahora" +
             "</a>" +
