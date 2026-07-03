@@ -147,6 +147,7 @@ app.get("/", function (req, res) {
       "GET /device/claim",
       "GET /device/activate-plan",
       "GET /company/activate-plan",
+      "GET /admin/create-devices-batch",
       "GET /test/qr-approved",
       "GET /pay/:device_code"
     ]
@@ -168,7 +169,7 @@ app.get("/health", function (req, res) {
 app.get("/debug/supabase", async function (req, res) {
   try {
     const data = await supabaseRequest(
-      "/rest/v1/devices?select=device_code,visible_name,status&limit=10",
+      "/rest/v1/devices?select=device_code,visible_name,status&limit=20",
       "GET"
     );
 
@@ -491,6 +492,53 @@ async function activateCompanyPlanHandler(req, res) {
 
 app.get("/company/activate-plan", activateCompanyPlanHandler);
 app.post("/company/activate-plan", activateCompanyPlanHandler);
+
+async function createDevicesBatchHandler(req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const prefix = getParam(req, ["prefix"], "PS");
+    const startNumberRaw = getParam(req, ["start", "start_number"], "4");
+    const quantityRaw = getParam(req, ["quantity", "qty"], "10");
+    const defaultName = getParam(req, ["name", "default_name"], "Dispositivo PaySync");
+    const qrPriceRaw = getParam(req, ["qr_price", "qr_price_ars"], "2000");
+    const pulsesRaw = getParam(req, ["pulses", "pulses_per_payment"], "1");
+    const billValueRaw = getParam(req, ["bill_value", "bill_pulse_value_ars"], "1000");
+
+    const startNumber = parseInt(startNumberRaw, 10);
+    const quantity = parseInt(quantityRaw, 10);
+    const qrPrice = parseInt(qrPriceRaw, 10);
+    const pulses = parseInt(pulsesRaw, 10);
+    const billValue = parseInt(billValueRaw, 10);
+
+    if (!startNumber || startNumber < 1) {
+      return fail(res, new Error("Invalid start number"), 400);
+    }
+
+    if (!quantity || quantity < 1 || quantity > 200) {
+      return fail(res, new Error("Invalid quantity. Use 1 to 200"), 400);
+    }
+
+    const data = await callRpc("create_devices_batch", {
+      p_prefix: prefix,
+      p_start_number: startNumber,
+      p_quantity: quantity,
+      p_default_name: defaultName,
+      p_qr_price_ars: qrPrice,
+      p_pulses_per_payment: pulses,
+      p_bill_pulse_value_ars: billValue
+    });
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/admin/create-devices-batch", createDevicesBatchHandler);
+app.post("/admin/create-devices-batch", createDevicesBatchHandler);
 
 app.get("/pay/:device_code", async function (req, res) {
   try {
