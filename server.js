@@ -57,6 +57,7 @@ function checkApiKey(req) {
 
 function ok(res, data) {
   if (data === undefined) data = {};
+
   return res.json({
     ok: true,
     data: data
@@ -145,7 +146,9 @@ app.get("/", function (req, res) {
       "GET /device/register-collection",
       "GET /device/claim",
       "GET /device/activate-plan",
-      "GET /test/qr-approved"
+      "GET /company/activate-plan",
+      "GET /test/qr-approved",
+      "GET /pay/:device_code"
     ]
   });
 });
@@ -451,65 +454,101 @@ async function activateDevicePlanHandler(req, res) {
 app.get("/device/activate-plan", activateDevicePlanHandler);
 app.post("/device/activate-plan", activateDevicePlanHandler);
 
+async function activateCompanyPlanHandler(req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const companyName = getParam(req, ["company", "company_name"]);
+    const planType = getParam(req, ["plan", "plan_type"], "monthly");
+    const onlyInactiveRaw = getParam(req, ["only_inactive"], "false");
+
+    if (!companyName) {
+      return fail(res, new Error("Missing company name"), 400);
+    }
+
+    if (planType !== "monthly" && planType !== "six_months") {
+      return fail(res, new Error("Invalid plan. Use monthly or six_months"), 400);
+    }
+
+    const onlyInactive =
+      onlyInactiveRaw === true ||
+      onlyInactiveRaw === "true" ||
+      onlyInactiveRaw === "1";
+
+    const data = await callRpc("activate_company_devices_plan_by_name", {
+      p_company_name: companyName,
+      p_plan_type: planType,
+      p_only_inactive: onlyInactive
+    });
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/company/activate-plan", activateCompanyPlanHandler);
+app.post("/company/activate-plan", activateCompanyPlanHandler);
+
 app.get("/pay/:device_code", async function (req, res) {
   try {
     const deviceCode = getParam(req, ["device_code"]);
 
-    let path =
+    const path =
       "/rest/v1/device_dashboard_summary?select=*&device_code=eq." +
       encodeURIComponent(deviceCode);
 
     const data = await supabaseRequest(path, "GET");
 
     if (!data || !Array.isArray(data) || data.length === 0) {
-      return res.status(404).send(`
-        <html>
-          <body style="font-family: Arial; background:#080b12; color:white; text-align:center; padding:40px;">
-            <h1>Dispositivo no encontrado</h1>
-            <p>El código ${deviceCode} no existe en PaySync.</p>
-          </body>
-        </html>
-      `);
+      return res.status(404).send(
+        "<html>" +
+          "<body style='font-family: Arial; background:#080b12; color:white; text-align:center; padding:40px;'>" +
+            "<h1>Dispositivo no encontrado</h1>" +
+            "<p>El codigo " + deviceCode + " no existe en PaySync.</p>" +
+          "</body>" +
+        "</html>"
+      );
     }
 
     const device = data[0];
 
     if (device.status !== "active") {
-      return res.status(403).send(`
-        <html>
-          <body style="font-family: Arial; background:#080b12; color:white; text-align:center; padding:40px;">
-            <h1>Dispositivo no disponible</h1>
-            <p>Esta máquina no está activa o tiene el plan vencido.</p>
-            <p>Código: ${deviceCode}</p>
-          </body>
-        </html>
-      `);
+      return res.status(403).send(
+        "<html>" +
+          "<body style='font-family: Arial; background:#080b12; color:white; text-align:center; padding:40px;'>" +
+            "<h1>Dispositivo no disponible</h1>" +
+            "<p>Esta maquina no esta activa o tiene el plan vencido.</p>" +
+            "<p>Codigo: " + deviceCode + "</p>" +
+          "</body>" +
+        "</html>"
+      );
     }
 
-    return res.send(`
-      <html>
-        <head>
-          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-          <title>PaySync - ${device.visible_name}</title>
-        </head>
-        <body style="font-family: Arial; background:#080b12; color:white; margin:0; padding:30px;">
-          <div style="max-width:420px; margin:auto; background:#111827; border:1px solid #263244; border-radius:20px; padding:24px; text-align:center;">
-            <h1 style="color:#16d9ff; margin-top:0;">PaySync</h1>
-            <h2>${device.visible_name}</h2>
-            <p style="color:#9ca3af;">Confirmá que esta es la máquina en la que querés jugar</p>
-            <p style="font-size:14px; color:#9ca3af;">Código: ${device.device_code}</p>
-            <p style="font-size:34px; font-weight:bold;">$${device.qr_price_ars}</p>
-            <a href="https://link.mercadopago.com/paysync-mensual"
-               style="display:block; background:#06c8f4; color:#001018; padding:16px; border-radius:14px; text-decoration:none; font-weight:bold; margin-top:20px;">
-              Pagar ahora
-            </a>
-            <p style="font-size:12px; color:#6b7280; margin-top:20px;">
-              Pago seguro con Mercado Pago
-            </p>
-          </div>
-        </body>
-      </html>
-    `);
+    return res.send(
+      "<html>" +
+        "<head>" +
+          "<meta name='viewport' content='width=device-width, initial-scale=1.0' />" +
+          "<title>PaySync - " + device.visible_name + "</title>" +
+        "</head>" +
+        "<body style='font-family: Arial; background:#080b12; color:white; margin:0; padding:30px;'>" +
+          "<div style='max-width:420px; margin:auto; background:#111827; border:1px solid #263244; border-radius:20px; padding:24px; text-align:center;'>" +
+            "<h1 style='color:#16d9ff; margin-top:0;'>PaySync</h1>" +
+            "<h2>" + device.visible_name + "</h2>" +
+            "<p style='color:#9ca3af;'>Confirma que esta es la maquina en la que queres jugar</p>" +
+            "<p style='font-size:14px; color:#9ca3af;'>Codigo: " + device.device_code + "</p>" +
+            "<p style='font-size:34px; font-weight:bold;'>$" + device.qr_price_ars + "</p>" +
+            "<a href='https://link.mercadopago.com/paysync-mensual' " +
+              "style='display:block; background:#06c8f4; color:#001018; padding:16px; border-radius:14px; text-decoration:none; font-weight:bold; margin-top:20px;'>" +
+              "Pagar ahora" +
+            "</a>" +
+            "<p style='font-size:12px; color:#6b7280; margin-top:20px;'>Pago seguro con Mercado Pago</p>" +
+          "</div>" +
+        "</body>" +
+      "</html>"
+    );
   } catch (error) {
     return fail(res, error);
   }
