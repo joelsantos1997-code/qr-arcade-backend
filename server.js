@@ -12,10 +12,13 @@ const PORT = process.env.PORT || 10000;
 
 const API_KEY = String(process.env.API_KEY || "Laluna123").trim();
 
-// URL fija de Supabase para evitar errores de variable o caracteres ocultos
-let SUPABASE_URL = "https://lrsladmyfriundetnnjw.supabase.co";
+let SUPABASE_URL = String(
+  process.env.SUPABASE_URL || "https://lrsladmyfriundetnnjw.supabase.co/rest/v1/"
+).trim();
 
-const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+const SUPABASE_SERVICE_ROLE_KEY = String(
+  process.env.SUPABASE_SERVICE_ROLE_KEY || ""
+).trim();
 
 if (SUPABASE_URL.endsWith("/rest/v1/")) {
   SUPABASE_URL = SUPABASE_URL.substring(0, SUPABASE_URL.length - 9);
@@ -30,24 +33,14 @@ while (SUPABASE_URL.endsWith("/")) {
 }
 
 function getParam(req, names, fallback) {
-  if (fallback === undefined) {
-    fallback = null;
-  }
+  if (fallback === undefined) fallback = null;
 
   for (let i = 0; i < names.length; i++) {
     const name = names[i];
 
-    if (req.body && req.body[name] !== undefined) {
-      return req.body[name];
-    }
-
-    if (req.query && req.query[name] !== undefined) {
-      return req.query[name];
-    }
-
-    if (req.params && req.params[name] !== undefined) {
-      return req.params[name];
-    }
+    if (req.body && req.body[name] !== undefined) return req.body[name];
+    if (req.query && req.query[name] !== undefined) return req.query[name];
+    if (req.params && req.params[name] !== undefined) return req.params[name];
   }
 
   return fallback;
@@ -63,17 +56,7 @@ function checkApiKey(req) {
 }
 
 function ok(res, data) {
-     req.query.key ||
-    (req.body ? req.body.key : null);
-
-  return key === API_KEY;
-}
-
-function ok(res, data) {
-  if (data === undefined) {
-    data = {};
-  }
-
+  if (data === undefined) data = {};
   return res.json({
     ok: true,
     data: data
@@ -81,9 +64,7 @@ function ok(res, data) {
 }
 
 function fail(res, error, statusCode) {
-  if (statusCode === undefined) {
-    statusCode = 500;
-  }
+  if (statusCode === undefined) statusCode = 500;
 
   console.error("ERROR:", error);
 
@@ -97,15 +78,15 @@ function fail(res, error, statusCode) {
 
 function supabaseHeaders() {
   return {
-    "apikey": SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": "Bearer " + SUPABASE_SERVICE_ROLE_KEY,
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: "Bearer " + SUPABASE_SERVICE_ROLE_KEY,
     "Content-Type": "application/json"
   };
 }
 
 async function supabaseRequest(path, method, bodyObject) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error("Supabase is not configured. Check Render Environment Variables.");
+    throw new Error("Supabase is not configured.");
   }
 
   const url = SUPABASE_URL + path;
@@ -138,7 +119,11 @@ async function supabaseRequest(path, method, bodyObject) {
 }
 
 async function callRpc(functionName, params) {
-  return await supabaseRequest("/rest/v1/rpc/" + functionName, "POST", params || {});
+  return await supabaseRequest(
+    "/rest/v1/rpc/" + functionName,
+    "POST",
+    params || {}
+  );
 }
 
 app.get("/", function (req, res) {
@@ -146,7 +131,22 @@ app.get("/", function (req, res) {
     ok: true,
     name: "PaySync Backend",
     status: "online",
-    mode: "supabase-rest"
+    service: "paysync-backend",
+    supabase_url: SUPABASE_URL,
+    endpoints: [
+      "GET /health",
+      "GET /debug/supabase",
+      "GET /device/config",
+      "GET /device/heartbeat",
+      "GET /device/bill-pulse",
+      "GET /device/consume-pulse",
+      "GET /device/live-status",
+      "GET /device/summary",
+      "GET /device/register-collection",
+      "GET /device/claim",
+      "GET /device/activate-plan",
+      "GET /test/qr-approved"
+    ]
   });
 });
 
@@ -165,7 +165,7 @@ app.get("/health", function (req, res) {
 app.get("/debug/supabase", async function (req, res) {
   try {
     const data = await supabaseRequest(
-      "/rest/v1/devices?select=device_code,visible_name,status&limit=5",
+      "/rest/v1/devices?select=device_code,visible_name,status&limit=10",
       "GET"
     );
 
@@ -303,7 +303,6 @@ app.get("/device/live-status", async function (req, res) {
     }
 
     const data = await supabaseRequest(path, "GET");
-
     return ok(res, data);
   } catch (error) {
     return fail(res, error);
@@ -321,7 +320,6 @@ app.get("/device/summary", async function (req, res) {
     }
 
     const data = await supabaseRequest(path, "GET");
-
     return ok(res, data);
   } catch (error) {
     return fail(res, error);
@@ -337,20 +335,16 @@ async function testQrApprovedHandler(req, res) {
     const deviceCode = getParam(req, ["device", "device_code"], "PS-000001");
 
     let paymentId = getParam(req, ["payment", "payment_id", "mp_payment_id"]);
-    let preferenceId = getParam(req, ["preference", "preference_id", "mp_preference_id"]);
+    let preferenceId = getParam(req, [
+      "preference",
+      "preference_id",
+      "mp_preference_id"
+    ]);
     let externalReference = getParam(req, ["external_reference"]);
 
-    if (!paymentId) {
-      paymentId = "MP-TEST-" + Date.now();
-    }
-
-    if (!preferenceId) {
-      preferenceId = "PREF-TEST-" + Date.now();
-    }
-
-    if (!externalReference) {
-      externalReference = deviceCode + "-" + paymentId;
-    }
+    if (!paymentId) paymentId = "MP-TEST-" + Date.now();
+    if (!preferenceId) preferenceId = "PREF-TEST-" + Date.now();
+    if (!externalReference) externalReference = deviceCode + "-" + paymentId;
 
     const data = await callRpc("register_qr_payment_by_device_code", {
       p_device_code: deviceCode,
@@ -367,11 +361,16 @@ async function testQrApprovedHandler(req, res) {
 
 app.get("/test/qr-approved", testQrApprovedHandler);
 app.post("/test/qr-approved", testQrApprovedHandler);
+
 async function registerCollectionHandler(req, res) {
   try {
     const deviceCode = getParam(req, ["device", "device_code"]);
     const deviceToken = getParam(req, ["token", "device_token"]);
-    const notes = getParam(req, ["notes"], "Recaudacion registrada desde PaySync");
+    const notes = getParam(
+      req,
+      ["notes"],
+      "Recaudacion registrada desde PaySync"
+    );
 
     if (!deviceCode || !deviceToken) {
       return fail(res, new Error("Missing device or token"), 400);
@@ -392,6 +391,134 @@ async function registerCollectionHandler(req, res) {
 app.get("/device/register-collection", registerCollectionHandler);
 app.post("/device/register-collection", registerCollectionHandler);
 
-app.listen(PORT, function () {
-  console.log("PaySync backend running on port " + PORT);
+async function claimDeviceHandler(req, res) {
+  try {
+    const deviceCode = getParam(req, ["device", "device_code", "code"]);
+    const companyName = getParam(req, ["company", "company_name"]);
+    const companyEmail = getParam(req, ["email", "company_email"], null);
+
+    if (!deviceCode) {
+      return fail(res, new Error("Missing device code"), 400);
+    }
+
+    if (!companyName) {
+      return fail(res, new Error("Missing company name"), 400);
+    }
+
+    const data = await callRpc("claim_device_by_code", {
+      p_device_code: deviceCode,
+      p_company_name: companyName,
+      p_company_email: companyEmail
+    });
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/device/claim", claimDeviceHandler);
+app.post("/device/claim", claimDeviceHandler);
+
+async function activateDevicePlanHandler(req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const deviceCode = getParam(req, ["device", "device_code", "code"]);
+    const planType = getParam(req, ["plan", "plan_type"], "monthly");
+
+    if (!deviceCode) {
+      return fail(res, new Error("Missing device code"), 400);
+    }
+
+    if (planType !== "monthly" && planType !== "six_months") {
+      return fail(res, new Error("Invalid plan. Use monthly or six_months"), 400);
+    }
+
+    const data = await callRpc("activate_device_plan_by_code", {
+      p_device_code: deviceCode,
+      p_plan_type: planType
+    });
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/device/activate-plan", activateDevicePlanHandler);
+app.post("/device/activate-plan", activateDevicePlanHandler);
+
+app.get("/pay/:device_code", async function (req, res) {
+  try {
+    const deviceCode = getParam(req, ["device_code"]);
+
+    let path =
+      "/rest/v1/device_dashboard_summary?select=*&device_code=eq." +
+      encodeURIComponent(deviceCode);
+
+    const data = await supabaseRequest(path, "GET");
+
+    if (!data || !Array.isArray(data) || data.length === 0) {
+      return res.status(404).send(`
+        <html>
+          <body style="font-family: Arial; background:#080b12; color:white; text-align:center; padding:40px;">
+            <h1>Dispositivo no encontrado</h1>
+            <p>El código ${deviceCode} no existe en PaySync.</p>
+          </body>
+        </html>
+      `);
+    }
+
+    const device = data[0];
+
+    if (device.status !== "active") {
+      return res.status(403).send(`
+        <html>
+          <body style="font-family: Arial; background:#080b12; color:white; text-align:center; padding:40px;">
+            <h1>Dispositivo no disponible</h1>
+            <p>Esta máquina no está activa o tiene el plan vencido.</p>
+            <p>Código: ${deviceCode}</p>
+          </body>
+        </html>
+      `);
+    }
+
+    return res.send(`
+      <html>
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+          <title>PaySync - ${device.visible_name}</title>
+        </head>
+        <body style="font-family: Arial; background:#080b12; color:white; margin:0; padding:30px;">
+          <div style="max-width:420px; margin:auto; background:#111827; border:1px solid #263244; border-radius:20px; padding:24px; text-align:center;">
+            <h1 style="color:#16d9ff; margin-top:0;">PaySync</h1>
+            <h2>${device.visible_name}</h2>
+            <p style="color:#9ca3af;">Confirmá que esta es la máquina en la que querés jugar</p>
+            <p style="font-size:14px; color:#9ca3af;">Código: ${device.device_code}</p>
+            <p style="font-size:34px; font-weight:bold;">$${device.qr_price_ars}</p>
+            <a href="https://link.mercadopago.com/paysync-mensual"
+               style="display:block; background:#06c8f4; color:#001018; padding:16px; border-radius:14px; text-decoration:none; font-weight:bold; margin-top:20px;">
+              Pagar ahora
+            </a>
+            <p style="font-size:12px; color:#6b7280; margin-top:20px;">
+              Pago seguro con Mercado Pago
+            </p>
+          </div>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    return fail(res, error);
+  }
 });
+
+if (require.main === module) {
+  app.listen(PORT, function () {
+    console.log("PaySync backend running on port " + PORT);
+  });
+}
+
+module.exports = app;
