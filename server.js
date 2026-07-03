@@ -46,6 +46,26 @@ function getParam(req, names, fallback) {
   return fallback;
 }
 
+function normalizeDeviceCode(value) {
+  const raw = String(value || "").trim().toUpperCase();
+  const digits = raw.replace(/[^0-9]/g, "");
+
+  if (!digits) {
+    return raw;
+  }
+
+  return "PS-" + digits.padStart(6, "0");
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 function checkApiKey(req) {
   const key =
     req.headers["x-api-key"] ||
@@ -148,6 +168,7 @@ app.get("/", function (req, res) {
       "GET /device/activate-plan",
       "GET /company/activate-plan",
       "GET /admin/create-devices-batch",
+      "GET /admin/print-qr",
       "GET /test/qr-approved",
       "GET /pay/:device_code"
     ]
@@ -169,7 +190,7 @@ app.get("/health", function (req, res) {
 app.get("/debug/supabase", async function (req, res) {
   try {
     const data = await supabaseRequest(
-      "/rest/v1/devices?select=device_code,visible_name,status&limit=20",
+      "/rest/v1/devices?select=device_code,visible_name,status&order=device_code.asc&limit=50",
       "GET"
     );
 
@@ -539,6 +560,122 @@ async function createDevicesBatchHandler(req, res) {
 
 app.get("/admin/create-devices-batch", createDevicesBatchHandler);
 app.post("/admin/create-devices-batch", createDevicesBatchHandler);
+
+app.get("/admin/print-qr", async function (req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const fromRaw = getParam(req, ["from", "start"], null);
+    const toRaw = getParam(req, ["to", "end"], null);
+    const statusRaw = getParam(req, ["status"], null);
+
+    let path =
+      "/rest/v1/devices?select=device_code,visible_name,status,qr_price_ars,pulses_per_payment,bill_pulse_value_ars&order=device_code.asc&limit=200";
+
+    if (fromRaw) {
+      const fromCode = normalizeDeviceCode(fromRaw);
+      path = path + "&device_code=" + encodeURIComponent("gte." + fromCode);
+    }
+
+    if (toRaw) {
+      const toCode = normalizeDeviceCode(toRaw);
+      path = path + "&device_code=" + encodeURIComponent("lte." + toCode);
+    }
+
+    if (statusRaw) {
+      path = path + "&status=" + encodeURIComponent("eq." + statusRaw);
+    }
+
+    const devices = await supabaseRequest(path, "GET");
+
+    const publicBaseUrl = "https://" + req.get("host");
+
+    let cardsHtml = "";
+
+    for (let i = 0; i < devices.length; i++) {
+      const device = devices[i];
+      const deviceCode = escapeHtml(device.device_code);
+      const visibleName = escapeHtml(device.visible_name || device.device_code);
+      const status = escapeHtml(device.status || "");
+      const price = escapeHtml(device.qr_price_ars || 0);
+      const pulses = escapeHtml(device.pulses_per_payment || 1);
+
+      const payUrl = publicBaseUrl + "/pay/" + encodeURIComponent(device.device_code);
+      const qrImage =
+        "https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=" +
+        encodeURIComponent(payUrl);
+
+      cardsHtml =
+        cardsHtml +
+        "<div class='card'>" +
+          "<div class='title'>" + deviceCode + "</div>" +
+          "<div class='name'>" + visibleName + "</div>" +
+          "<img class='qr' src='" + qrImage + "' />" +
+          "<div class='price'>$" + price + "</div>" +
+          "<div class='meta'>Pulsos por pago: " + pulses + "</div>" +
+          "<div class='meta'>Estado: " + status + "</div>" +
+          "<div class='url'>" + escapeHtml(payUrl) + "</div>" +
+        "</div>";
+    }
+
+    if (!cardsHtml) {
+      cardsHtml =
+        "<div style='padding:30px; text-align:center; color:#555;'>No hay dispositivos para mostrar.</div>";
+    }
+
+    return res.send(
+      "<html>" +
+        "<head>" +
+          "<meta name='viewport' content='width=device-width, initial-scale=1.0' />" +
+          "<title>PaySync - QR imprimibles</title>" +
+          "<style>" +
+            "body{font-family:Arial,sans-serif;background:#f3f4f6;margin:0;padding:24px;color:#111827;}" +
+            ".top{max-width:1100px;margin:0 auto 20px auto;background:white;border-radius:14px;padding:18px 22px;box-shadow:0 2px 10px rgba(0,0,0,.08);}" +
+            ".top h1{margin:0;color:#0f172a;font-size:26px;}" +
+            ".top p{margin:8px 0 0 0;color:#475569;}" +
+            ".actions{margin-top:14px;display:flex;gap:10px;flex-wrap:wrap;}" +
+            ".btn{border:0;background:#06c8f4;color:#001018;padding:12px 16px;border-radius:10px;font-weight:bold;cursor:pointer;}" +
+            ".grid{max-width:1100px;margin:auto;display:grid;grid-template-columns:repeat(3,1fr);gap:16px;}" +
+            ".card{background:white;border:2px solid #111827;border-radius:14px;padding:16px;text-align:center;break-inside:avoid;page-break-inside:avoid;}" +
+            ".title{font-size:24px;font-weight:900;letter-spacing:.5px;color:#0f172a;}" +
+            ".name{font-size:14px;color:#475569;margin-top:4px;min-height:34px;}" +
+            ".qr{width:190px;height:190px;margin:12px auto;display:block;}" +
+            ".price{font-size:28px;font-weight:900;color:#111827;margin-top:4px;}" +
+            ".meta{font-size:12px;color:#475569;margin-top:4px;}" +
+            ".url{font-size:10px;color:#334155;margin-top:10px;word-break:break-all;border-top:1px dashed #cbd5e1;padding-top:8px;}" +
+            "@media print{" +
+              "body{background:white;padding:0;}" +
+              ".top{box-shadow:none;border-bottom:1px solid #ddd;border-radius:0;max-width:none;margin:0 0 10px 0;}" +
+              ".actions{display:none;}" +
+              ".grid{max-width:none;grid-template-columns:repeat(3,1fr);gap:8px;}" +
+              ".card{border:1.5px solid #000;border-radius:8px;padding:10px;}" +
+              ".qr{width:165px;height:165px;}" +
+              ".title{font-size:20px;}" +
+              ".price{font-size:24px;}" +
+            "}" +
+          "</style>" +
+        "</head>" +
+        "<body>" +
+          "<div class='top'>" +
+            "<h1>PaySync - QR imprimibles</h1>" +
+            "<p>Total de dispositivos mostrados: <b>" + devices.length + "</b></p>" +
+            "<p>Tip: podés filtrar por rango usando <b>?from=4&to=8&key=Laluna123</b></p>" +
+            "<div class='actions'>" +
+              "<button class='btn' onclick='window.print()'>Imprimir / Guardar PDF</button>" +
+            "</div>" +
+          "</div>" +
+          "<div class='grid'>" +
+            cardsHtml +
+          "</div>" +
+        "</body>" +
+      "</html>"
+    );
+  } catch (error) {
+    return fail(res, error);
+  }
+});
 
 app.get("/pay/:device_code", async function (req, res) {
   try {
