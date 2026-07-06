@@ -2244,6 +2244,109 @@ async function mercadoPagoWebhookHandler(req, res) {
       });
     }
 
+    const metadata = payment.metadata || {};
+    const externalReference = String(payment.external_reference || "");
+    const parts = externalReference.split("|");
+
+    const paymentType = String(
+      metadata.payment_type ||
+      metadata.paymentType ||
+      ""
+    );
+
+    const isPlanPayment =
+      paymentType === "plan_subscription" ||
+      parts[0] === "PLAN";
+
+    const amountArs = Math.round(Number(payment.transaction_amount || 0));
+
+    if (isPlanPayment) {
+      const planScope = String(
+        metadata.plan_scope ||
+        metadata.scope ||
+        parts[1] ||
+        ""
+      );
+
+      const planType = String(
+        metadata.plan_type ||
+        parts[3] ||
+        "monthly"
+      );
+
+      const preferenceId = String(
+        payment.preference_id ||
+        (payment.order && payment.order.id) ||
+        "PREF-" + payment.id
+      );
+
+      if (planScope === "device") {
+        const deviceCode = normalizeDeviceCode(
+          metadata.device_code ||
+          metadata.deviceCode ||
+          parts[2] ||
+          ""
+        );
+
+        if (!deviceCode || deviceCode === "PS-000000") {
+          return fail(res, new Error("Plan payment approved but device_code was not found"), 400);
+        }
+
+        const data = await callRpc("register_device_plan_payment_by_code", {
+          p_device_code: deviceCode,
+          p_plan_type: planType,
+          p_mp_payment_id: String(payment.id),
+          p_mp_preference_id: preferenceId,
+          p_external_reference: externalReference,
+          p_amount_ars: amountArs
+        });
+
+        return ok(res, {
+          message: "Pago de abono de dispositivo aprobado y registrado",
+          payment_id: payment.id,
+          scope: "device",
+          device_code: deviceCode,
+          plan_type: planType,
+          amount_ars: amountArs,
+          result: data
+        });
+      }
+
+      if (planScope === "company") {
+        const companyName = String(
+          metadata.company_name ||
+          metadata.companyName ||
+          parts[2] ||
+          ""
+        );
+
+        if (!companyName) {
+          return fail(res, new Error("Plan payment approved but company_name was not found"), 400);
+        }
+
+        const data = await callRpc("register_company_plan_payment_by_name", {
+          p_company_name: companyName,
+          p_plan_type: planType,
+          p_mp_payment_id: String(payment.id),
+          p_mp_preference_id: preferenceId,
+          p_external_reference: externalReference,
+          p_amount_ars: amountArs
+        });
+
+        return ok(res, {
+          message: "Pago de abono de empresa aprobado y registrado",
+          payment_id: payment.id,
+          scope: "company",
+          company_name: companyName,
+          plan_type: planType,
+          amount_ars: amountArs,
+          result: data
+        });
+      }
+
+      return fail(res, new Error("Invalid plan payment scope"), 400);
+    }
+
     const existing = await supabaseRequest(
       "/rest/v1/qr_payments?select=id,mp_payment_id&mp_payment_id=eq." +
         encodeURIComponent(String(payment.id)) +
@@ -2253,13 +2356,10 @@ async function mercadoPagoWebhookHandler(req, res) {
 
     if (existing && Array.isArray(existing) && existing.length > 0) {
       return ok(res, {
-        message: "Pago ya registrado anteriormente",
+        message: "Pago QR ya registrado anteriormente",
         payment_id: payment.id
       });
     }
-
-    const metadata = payment.metadata || {};
-    const externalReference = String(payment.external_reference || "");
 
     let deviceCode =
       metadata.device_code ||
@@ -2287,7 +2387,7 @@ async function mercadoPagoWebhookHandler(req, res) {
     });
 
     return ok(res, {
-      message: "Pago aprobado registrado en PaySync",
+      message: "Pago QR aprobado registrado en PaySync",
       payment_id: payment.id,
       device_code: deviceCode,
       result: data
