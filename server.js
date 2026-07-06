@@ -1104,6 +1104,7 @@ app.get("/", function (req, res) {
       "GET /device/activate-plan",
       "GET /company/activate-plan",
       "GET /admin/create-devices-batch",
+      "GET /admin/update-device-config",
       "GET /admin/print-qr",
       "GET /admin/devices-technical",
       "GET /admin/firmware",
@@ -1500,6 +1501,47 @@ async function createDevicesBatchHandler(req, res) {
 
 app.get("/admin/create-devices-batch", createDevicesBatchHandler);
 app.post("/admin/create-devices-batch", createDevicesBatchHandler);
+
+async function updateDeviceConfigHandler(req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const deviceCode = getParam(req, ["device", "device_code", "code"]);
+    const visibleName = getParam(req, ["name", "visible_name"], null);
+
+    const qrPriceRaw = getParam(req, ["qr_price", "qr_price_ars"], null);
+    const pulsesRaw = getParam(req, ["pulses", "pulses_per_payment"], null);
+    const billValueRaw = getParam(req, ["bill_value", "bill_pulse_value_ars"], null);
+    const coinValueRaw = getParam(req, ["coin_value", "coin_pulse_value_ars"], null);
+
+    if (!deviceCode) {
+      return fail(res, new Error("Missing device code"), 400);
+    }
+
+    const qrPrice = qrPriceRaw === null || qrPriceRaw === "" ? null : parseInt(qrPriceRaw, 10);
+    const pulses = pulsesRaw === null || pulsesRaw === "" ? null : parseInt(pulsesRaw, 10);
+    const billValue = billValueRaw === null || billValueRaw === "" ? null : parseInt(billValueRaw, 10);
+    const coinValue = coinValueRaw === null || coinValueRaw === "" ? null : parseInt(coinValueRaw, 10);
+
+    const data = await callRpc("update_device_config_by_code", {
+      p_device_code: deviceCode,
+      p_visible_name: visibleName,
+      p_qr_price_ars: qrPrice,
+      p_pulses_per_payment: pulses,
+      p_bill_pulse_value_ars: billValue,
+      p_coin_pulse_value_ars: coinValue
+    });
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/admin/update-device-config", updateDeviceConfigHandler);
+app.post("/admin/update-device-config", updateDeviceConfigHandler);
 
 app.get("/admin/firmware", async function (req, res) {
   try {
