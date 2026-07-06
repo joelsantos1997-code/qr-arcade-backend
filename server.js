@@ -2143,6 +2143,162 @@ app.get("/pay/:device_code", async function (req, res) {
     return fail(res, error);
   }
 });
+app.get("/admin/companies", async function (req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const data = await supabaseRequest(
+      "/rest/v1/company_dashboard_summary?select=*&order=company_name.asc",
+      "GET"
+    );
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+});
+
+app.get("/admin/company-devices", async function (req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const companyName = getParam(req, ["company", "company_name"], null);
+    const companyId = getParam(req, ["company_id"], null);
+
+    let resolvedCompanyId = companyId;
+
+    if (!resolvedCompanyId) {
+      if (!companyName) {
+        return fail(res, new Error("Missing company or company_id"), 400);
+      }
+
+      const companies = await supabaseRequest(
+        "/rest/v1/companies?select=id,name,contact_email,status&name=eq." +
+          encodeURIComponent(companyName) +
+          "&limit=1",
+        "GET"
+      );
+
+      if (!companies || !Array.isArray(companies) || companies.length === 0) {
+        return fail(res, new Error("Company not found"), 404);
+      }
+
+      resolvedCompanyId = companies[0].id;
+    }
+
+    const devices = await supabaseRequest(
+      "/rest/v1/devices?select=device_code,visible_name,status,qr_price_ars,pulses_per_payment,bill_pulse_value_ars,coin_pulse_value_ars,subscription_status,subscription_expires_at,last_seen_at,wifi_rssi,firmware_version&company_id=eq." +
+        encodeURIComponent(resolvedCompanyId) +
+        "&order=device_code.asc",
+      "GET"
+    );
+
+    return ok(res, {
+      company_id: resolvedCompanyId,
+      devices: devices
+    });
+  } catch (error) {
+    return fail(res, error);
+  }
+});
+
+async function upsertCompanyHandler(req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const companyName = getParam(req, ["company", "company_name", "name"]);
+    const companyEmail = getParam(req, ["email", "company_email"], null);
+    const companyStatus = getParam(req, ["status", "company_status"], "active");
+
+    if (!companyName) {
+      return fail(res, new Error("Missing company name"), 400);
+    }
+
+    const data = await callRpc("upsert_company_by_name", {
+      p_company_name: companyName,
+      p_company_email: companyEmail,
+      p_company_status: companyStatus
+    });
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/admin/upsert-company", upsertCompanyHandler);
+app.post("/admin/upsert-company", upsertCompanyHandler);
+
+async function assignDeviceHandler(req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const deviceCode = getParam(req, ["device", "device_code", "code"]);
+    const companyName = getParam(req, ["company", "company_name"]);
+    const companyEmail = getParam(req, ["email", "company_email"], null);
+    const forceRaw = getParam(req, ["force", "force_reassign"], "true");
+
+    if (!deviceCode) {
+      return fail(res, new Error("Missing device code"), 400);
+    }
+
+    if (!companyName) {
+      return fail(res, new Error("Missing company name"), 400);
+    }
+
+    const forceReassign =
+      forceRaw === true ||
+      forceRaw === "true" ||
+      forceRaw === "1";
+
+    const data = await callRpc("admin_assign_device_to_company", {
+      p_device_code: deviceCode,
+      p_company_name: companyName,
+      p_company_email: companyEmail,
+      p_force_reassign: forceReassign
+    });
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/admin/assign-device", assignDeviceHandler);
+app.post("/admin/assign-device", assignDeviceHandler);
+
+async function unassignDeviceHandler(req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const deviceCode = getParam(req, ["device", "device_code", "code"]);
+
+    if (!deviceCode) {
+      return fail(res, new Error("Missing device code"), 400);
+    }
+
+    const data = await callRpc("admin_unassign_device_by_code", {
+      p_device_code: deviceCode
+    });
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/admin/unassign-device", unassignDeviceHandler);
+app.post("/admin/unassign-device", unassignDeviceHandler);
 
 if (require.main === module) {
   app.listen(PORT, function () {
