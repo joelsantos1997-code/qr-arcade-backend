@@ -67,6 +67,12 @@ function escapeHtml(value) {
     .replace(/'/g, "&#039;");
 }
 
+function cppString(value) {
+  return String(value || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"');
+}
+
 function getPublicBaseUrl(req) {
   if (process.env.PUBLIC_BASE_URL) {
     return String(process.env.PUBLIC_BASE_URL).replace(/\/$/, "");
@@ -206,6 +212,23 @@ async function getDeviceFromSummary(deviceCode) {
   return data[0];
 }
 
+async function getDeviceTechnical(deviceCode) {
+  const normalizedCode = normalizeDeviceCode(deviceCode);
+
+  const path =
+    "/rest/v1/devices?select=device_code,device_token,visible_name,status,qr_price_ars,pulses_per_payment,bill_pulse_value_ars,subscription_status,subscription_expires_at&device_code=eq." +
+    encodeURIComponent(normalizedCode) +
+    "&limit=1";
+
+  const data = await supabaseRequest(path, "GET");
+
+  if (!data || !Array.isArray(data) || data.length === 0) {
+    return null;
+  }
+
+  return data[0];
+}
+
 function paymentStatusPage(title, message, deviceCode) {
   return (
     "<html>" +
@@ -222,6 +245,841 @@ function paymentStatusPage(title, message, deviceCode) {
       "</body>" +
     "</html>"
   );
+}
+
+function generateEspFirmware(deviceCode, deviceToken) {
+  const safeDeviceCode = cppString(deviceCode);
+  const safeDeviceToken = cppString(deviceToken);
+
+  return String.raw`#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecureBearSSL.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+#include <EEPROM.h>
+#include <memory>
+#include <ctype.h>
+
+// ======================================================
+// PAYSYNC - CONFIGURACION DEL DISPOSITIVO
+// ======================================================
+
+const String BACKEND_URL = "https://qr-arcade-backend.vercel.app";
+
+const String DEVICE_CODE = "${safeDeviceCode}";
+const String DEVICE_TOKEN = "${safeDeviceToken}";
+
+// ======================================================
+// RED LOCAL DE CONFIGURACION
+// ======================================================
+
+String AP_SSID = String("PaySync-") + DEVICE_CODE;
+
+// Clave de la red local PaySync.
+// Sin espacios:
+const char* AP_PASS = "PSync1234";
+
+// IP local del portal
+IPAddress AP_IP(192, 168, 4, 1);
+IPAddress AP_GATEWAY(192, 168, 4, 1);
+IPAddress AP_SUBNET(255, 255, 255, 0);
+
+// ======================================================
+// PINES NODEMCU
+// ======================================================
+
+const int RELAY_PIN = D5;        // Rele de credito / coin
+const int BILL_PIN = D2;         // Entrada billetero con optoacoplador
+const int COLLECTION_PIN = D7;   // Boton fisico de recaudacion
+
+// LED testigo.
+// En NodeMCU el LED interno suele ser LED_BUILTIN / D4.
+// Si tu LED testigo externo esta en otro pin, cambia esta linea.
+const int STATUS_LED_PIN = LED_BUILTIN;
+
+// Muchos reles de Arduino activan con LOW.
+// Si tu rele queda prendido al reves, cambia true por false.
+const bool RELAY_ACTIVE_LOW = true;
+
+// LED interno NodeMCU normalmente activa con LOW.
+const bool STATUS_LED_ACTIVE_LOW = true;
+
+// Entradas con INPUT_PULLUP.
+// Con opto o boton a GND, el pulso activo es LOW.
+const bool BILL_ACTIVE_LOW = true;
+const bool COLLECTION_ACTIVE_LOW = true;
+
+// ======================================================
+// TIEMPOS
+// ======================================================
+
+const unsigned long HEARTBEAT_INTERVAL_MS = 30000;
+const unsigned long CHECK_PULSE_INTERVAL_MS = 2500;
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 15000;
+
+const unsigned long COIN_PULSE_MS = 180;
+const unsigned long BILL_DEBOUNCE_MS = 350;
+const unsigned long COLLECTION_DEBOUNCE_MS = 1500;
+
+// ======================================================
+// EEPROM WIFI
+// ======================================================
+
+const int EEPROM_SIZE = 256;
+const int MAGIC_ADDR = 0;
+const int SSID_ADDR = 16;
+const int PASS_ADDR = 96;
+const int SSID_MAX = 64;
+const int PASS_MAX = 96;
+
+const String EEPROM_MAGIC = "PAYSYNC1";
+
+String savedSsid = "";
+String savedPass = "";
+
+// ======================================================
+// SERVIDORES LOCALES
+// ======================================================
+
+ESP8266WebServer server(80);
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+
+// ======================================================
+// VARIABLES INTERNAS
+// ======================================================
+
+unsigned long lastHeartbeat = 0;
+unsigned long lastCheckPulse = 0;
+unsigned long lastReconnectAttempt = 0;
+unsigned long lastBillPulse = 0;
+unsigned long lastCollectionPress = 0;
+unsigned long lastLedBlink = 0;
+
+bool lastBillActive = false;
+bool lastCollectionActive = false;
+bool ledBlinkState = false;
+
+// ======================================================
+// UTILIDADES
+// ======================================================
+
+String htmlEscape(String value) {
+  value.replace("&", "&amp;");
+  value.replace("<", "&lt;");
+  value.replace(">", "&gt;");
+  value.replace("\"", "&quot;");
+  value.replace("'", "&#039;");
+  return value;
+}
+
+String urlEncode(String value) {
+  String encoded = "";
+
+  for (int i = 0; i < value.length(); i++) {
+    char c = value.charAt(i);
+
+    if (isalnum(c)) {
+      encoded += c;
+    } else if (c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += c;
+    } else if (c == ' ') {
+      encoded += "%20";
+    } else {
+      char hex[4];
+      sprintf(hex, "%%%02X", (unsigned char)c);
+      encoded += hex;
+    }
+  }
+
+  return encoded;
+}
+
+// ======================================================
+// EEPROM
+// ======================================================
+
+String readEEPROMString(int start, int maxLen) {
+  String value = "";
+
+  for (int i = 0; i < maxLen; i++) {
+    char c = char(EEPROM.read(start + i));
+
+    if (c == 0 || c == 255) {
+      break;
+    }
+
+    value += c;
+  }
+
+  return value;
+}
+
+void writeEEPROMString(int start, int maxLen, String value) {
+  for (int i = 0; i < maxLen; i++) {
+    if (i < value.length()) {
+      EEPROM.write(start + i, value.charAt(i));
+    } else {
+      EEPROM.write(start + i, 0);
+    }
+  }
+}
+
+void loadWiFiCredentials() {
+  String magic = readEEPROMString(MAGIC_ADDR, 12);
+
+  if (magic == EEPROM_MAGIC) {
+    savedSsid = readEEPROMString(SSID_ADDR, SSID_MAX);
+    savedPass = readEEPROMString(PASS_ADDR, PASS_MAX);
+  } else {
+    savedSsid = "";
+    savedPass = "";
+  }
+
+  Serial.println("");
+  Serial.println("Credenciales guardadas:");
+  Serial.print("SSID: ");
+  Serial.println(savedSsid.length() > 0 ? savedSsid : "(sin WiFi guardado)");
+}
+
+void saveWiFiCredentials(String ssid, String pass) {
+  writeEEPROMString(MAGIC_ADDR, 12, EEPROM_MAGIC);
+  writeEEPROMString(SSID_ADDR, SSID_MAX, ssid);
+  writeEEPROMString(PASS_ADDR, PASS_MAX, pass);
+  EEPROM.commit();
+
+  savedSsid = ssid;
+  savedPass = pass;
+}
+
+void clearWiFiCredentials() {
+  for (int i = 0; i < EEPROM_SIZE; i++) {
+    EEPROM.write(i, 0);
+  }
+
+  EEPROM.commit();
+
+  savedSsid = "";
+  savedPass = "";
+}
+
+// ======================================================
+// LED TESTIGO
+// ======================================================
+
+void statusLedSet(bool on) {
+  if (STATUS_LED_ACTIVE_LOW) {
+    digitalWrite(STATUS_LED_PIN, on ? LOW : HIGH);
+  } else {
+    digitalWrite(STATUS_LED_PIN, on ? HIGH : LOW);
+  }
+}
+
+void updateStatusLed() {
+  if (WiFi.status() == WL_CONNECTED) {
+    statusLedSet(true);
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (now - lastLedBlink >= 500) {
+    lastLedBlink = now;
+    ledBlinkState = !ledBlinkState;
+    statusLedSet(ledBlinkState);
+  }
+}
+
+// ======================================================
+// RELAY / CREDITO
+// ======================================================
+
+void relayOff() {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(RELAY_PIN, HIGH);
+  } else {
+    digitalWrite(RELAY_PIN, LOW);
+  }
+}
+
+void relayOn() {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(RELAY_PIN, LOW);
+  } else {
+    digitalWrite(RELAY_PIN, HIGH);
+  }
+}
+
+void sendCoinPulse() {
+  Serial.println("");
+  Serial.println(">>> ENTREGANDO CREDITO / PULSO RELAY");
+
+  relayOn();
+  delay(COIN_PULSE_MS);
+  relayOff();
+
+  Serial.println(">>> PULSO FINALIZADO");
+}
+
+// ======================================================
+// HTTP HTTPS
+// ======================================================
+
+String httpGet(String url) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("No hay WiFi. No se puede llamar al backend.");
+    return "";
+  }
+
+  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  client->setInsecure();
+
+  HTTPClient https;
+
+  Serial.println("");
+  Serial.println("GET:");
+  Serial.println(url);
+
+  if (!https.begin(*client, url)) {
+    Serial.println("ERROR: no se pudo iniciar HTTPS");
+    return "";
+  }
+
+  https.setTimeout(12000);
+
+  int httpCode = https.GET();
+  String payload = https.getString();
+
+  Serial.print("HTTP CODE: ");
+  Serial.println(httpCode);
+
+  Serial.println("RESPUESTA:");
+  Serial.println(payload);
+
+  https.end();
+
+  if (httpCode <= 0) {
+    Serial.println("ERROR HTTP");
+    return "";
+  }
+
+  return payload;
+}
+
+bool responseHasPulse(String body) {
+  body.toLowerCase();
+
+  if (body.length() == 0) return false;
+
+  if (body.indexOf("no pending") >= 0) return false;
+  if (body.indexOf("sin pulsos") >= 0) return false;
+  if (body.indexOf("no hay") >= 0) return false;
+  if (body.indexOf("\"pending_pulses\":0") >= 0) return false;
+  if (body.indexOf("\"pulses_pending\":0") >= 0) return false;
+
+  if (body.indexOf("\"pulse_delivered\":true") >= 0) return true;
+  if (body.indexOf("\"delivered\":true") >= 0) return true;
+  if (body.indexOf("\"should_pulse\":true") >= 0) return true;
+  if (body.indexOf("\"has_pulse\":true") >= 0) return true;
+  if (body.indexOf("\"can_pulse\":true") >= 0) return true;
+
+  if (body.indexOf("true") >= 0 && body.indexOf("pulse") >= 0) return true;
+  if (body.indexOf("true") >= 0 && body.indexOf("pulso") >= 0) return true;
+  if (body.indexOf("entregado") >= 0) return true;
+  if (body.indexOf("delivered") >= 0 && body.indexOf("true") >= 0) return true;
+
+  return false;
+}
+
+// ======================================================
+// ENDPOINTS PAYSYNC
+// ======================================================
+
+void sendHeartbeat() {
+  String url = BACKEND_URL +
+    "/device/heartbeat?device=" + urlEncode(DEVICE_CODE) +
+    "&token=" + urlEncode(DEVICE_TOKEN) +
+    "&rssi=" + String(WiFi.RSSI()) +
+    "&firmware=esp8266-final-v3";
+
+  httpGet(url);
+}
+
+void checkPendingPulse() {
+  String url = BACKEND_URL +
+    "/device/consume-pulse?device=" + urlEncode(DEVICE_CODE) +
+    "&token=" + urlEncode(DEVICE_TOKEN);
+
+  String body = httpGet(url);
+
+  if (responseHasPulse(body)) {
+    sendCoinPulse();
+  } else {
+    Serial.println("No hay pulsos pendientes.");
+  }
+}
+
+void registerBillPulse() {
+  String eventUid =
+    DEVICE_CODE +
+    "-bill-" +
+    String(ESP.getChipId(), HEX) +
+    "-" +
+    String(millis());
+
+  String url = BACKEND_URL +
+    "/device/bill-pulse?device=" + urlEncode(DEVICE_CODE) +
+    "&token=" + urlEncode(DEVICE_TOKEN) +
+    "&event_uid=" + urlEncode(eventUid);
+
+  httpGet(url);
+}
+
+void registerCollection() {
+  String url = BACKEND_URL +
+    "/device/register-collection?device=" + urlEncode(DEVICE_CODE) +
+    "&token=" + urlEncode(DEVICE_TOKEN) +
+    "&notes=" + urlEncode("Recaudacion desde boton fisico ESP");
+
+  httpGet(url);
+}
+
+// ======================================================
+// WIFI
+// ======================================================
+
+void startAccessPoint() {
+  WiFi.mode(WIFI_AP_STA);
+
+  WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
+
+  bool apStarted = WiFi.softAP(AP_SSID.c_str(), AP_PASS);
+
+  Serial.println("");
+  Serial.println("Portal PaySync:");
+  Serial.print("Red: ");
+  Serial.println(AP_SSID);
+  Serial.print("Clave: ");
+  Serial.println(AP_PASS);
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  if (apStarted) {
+    Serial.println("Access Point iniciado OK");
+  } else {
+    Serial.println("ERROR iniciando Access Point");
+  }
+
+  dnsServer.start(DNS_PORT, "*", AP_IP);
+}
+
+bool connectSavedWiFi(unsigned long timeoutMs) {
+  if (savedSsid.length() == 0) {
+    Serial.println("No hay WiFi guardado.");
+    return false;
+  }
+
+  Serial.println("");
+  Serial.println("Conectando al WiFi guardado...");
+  Serial.print("SSID: ");
+  Serial.println(savedSsid);
+
+  WiFi.hostname(DEVICE_CODE);
+  WiFi.begin(savedSsid.c_str(), savedPass.c_str());
+
+  unsigned long startAttempt = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < timeoutMs) {
+    delay(500);
+    Serial.print(".");
+    updateStatusLed();
+  }
+
+  Serial.println("");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi conectado OK");
+    Serial.print("IP local: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("RSSI: ");
+    Serial.println(WiFi.RSSI());
+    return true;
+  }
+
+  Serial.println("No conecto al WiFi guardado. El portal queda disponible.");
+  return false;
+}
+
+void maintainWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (savedSsid.length() == 0) return;
+
+  unsigned long now = millis();
+
+  if (now - lastReconnectAttempt >= WIFI_RECONNECT_INTERVAL_MS) {
+    lastReconnectAttempt = now;
+
+    Serial.println("");
+    Serial.println("WiFi desconectado. Reintentando...");
+    WiFi.begin(savedSsid.c_str(), savedPass.c_str());
+  }
+}
+
+// ======================================================
+// PORTAL WEB LOCAL
+// ======================================================
+
+void redirectToRoot() {
+  server.sendHeader("Location", "http://192.168.4.1/", true);
+  server.send(302, "text/plain", "");
+}
+
+String buildWifiOptionsHtml() {
+  String options = "";
+
+  Serial.println("");
+  Serial.println("Escaneando redes WiFi...");
+  int n = WiFi.scanNetworks(false, true);
+
+  if (n <= 0) {
+    options += "<option value=''>No se encontraron redes</option>";
+    return options;
+  }
+
+  for (int i = 0; i < n; i++) {
+    String ssid = WiFi.SSID(i);
+
+    if (ssid.length() == 0) {
+      continue;
+    }
+
+    String safeSsid = htmlEscape(ssid);
+
+    options += String("<option value='") +
+      safeSsid +
+      "'>" +
+      safeSsid +
+      "</option>";
+  }
+
+  WiFi.scanDelete();
+
+  if (options.length() == 0) {
+    options += "<option value=''>No se encontraron redes visibles</option>";
+  }
+
+  return options;
+}
+
+void handleRoot() {
+  bool connected = WiFi.status() == WL_CONNECTED;
+
+  String wifiStatus = connected ? "Conectado" : "Sin conexion";
+  String wifiName = connected ? WiFi.SSID() : "No conectado";
+  String localIp = connected ? WiFi.localIP().toString() : "-";
+  String rssi = connected ? String(WiFi.RSSI()) + " dBm" : "-";
+
+  String html = "";
+  html.reserve(12000);
+
+  html += "<html>";
+  html += "<head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<meta charset='UTF-8'>";
+  html += "<title>PaySync</title>";
+  html += "<style>";
+  html += "body{margin:0;font-family:Arial,sans-serif;background:#080b12;color:white;padding:18px;}";
+  html += ".box{max-width:460px;margin:auto;background:#111827;border:1px solid #263244;border-radius:22px;padding:22px;box-shadow:0 8px 30px rgba(0,0,0,.35);}";
+  html += "h1{margin:0;color:#16d9ff;font-size:32px;text-align:center;}";
+  html += "h2{font-size:18px;color:#e5e7eb;margin-top:22px;}";
+  html += ".device{text-align:center;color:#94a3b8;margin-top:6px;font-size:14px;}";
+  html += ".status{background:#0b1220;border:1px solid #263244;border-radius:14px;padding:14px;margin-top:18px;}";
+  html += ".row{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid #1f2937;padding:8px 0;font-size:14px;}";
+  html += ".row:last-child{border-bottom:0;}";
+  html += ".label{color:#94a3b8;}";
+  html += ".value{font-weight:bold;text-align:right;}";
+  html += ".ok{color:#22c55e;}";
+  html += ".bad{color:#f97316;}";
+  html += "select,input{width:100%;box-sizing:border-box;border:1px solid #334155;border-radius:12px;background:#020617;color:white;padding:13px;margin-top:8px;font-size:16px;}";
+  html += "button,.btn{width:100%;box-sizing:border-box;border:0;border-radius:12px;background:#06c8f4;color:#001018;padding:14px;font-weight:900;font-size:16px;margin-top:12px;text-decoration:none;display:block;text-align:center;}";
+  html += ".secondary{background:#1f2937;color:#e5e7eb;border:1px solid #334155;}";
+  html += ".danger{background:#7f1d1d;color:white;}";
+  html += ".mini{font-size:12px;color:#64748b;margin-top:10px;text-align:center;line-height:1.45;}";
+  html += "</style>";
+  html += "</head>";
+  html += "<body>";
+  html += "<div class='box'>";
+  html += "<h1>PaySync</h1>";
+  html += String("<div class='device'>") + htmlEscape(DEVICE_CODE) + "</div>";
+
+  html += "<div class='status'>";
+  html += "<div class='row'><div class='label'>Estado</div><div class='value ";
+  html += connected ? "ok" : "bad";
+  html += "'>";
+  html += wifiStatus;
+  html += "</div></div>";
+
+  html += String("<div class='row'><div class='label'>WiFi actual</div><div class='value'>") + htmlEscape(wifiName) + "</div></div>";
+  html += String("<div class='row'><div class='label'>IP local</div><div class='value'>") + htmlEscape(localIp) + "</div></div>";
+  html += String("<div class='row'><div class='label'>Senal</div><div class='value'>") + htmlEscape(rssi) + "</div></div>";
+  html += String("<div class='row'><div class='label'>Red config</div><div class='value'>") + htmlEscape(AP_SSID) + "</div></div>";
+  html += "</div>";
+
+  html += "<h2>Configurar WiFi</h2>";
+  html += "<form method='POST' action='/save'>";
+  html += "<label>Redes cercanas</label>";
+  html += "<select name='ssid'>";
+  html += buildWifiOptionsHtml();
+  html += "</select>";
+
+  html += "<label style='display:block;margin-top:12px;'>O escribir red manualmente</label>";
+  html += "<input name='ssid_manual' placeholder='Nombre de red WiFi'>";
+
+  html += "<label style='display:block;margin-top:12px;'>Contrasena del WiFi</label>";
+  html += "<input name='pass' type='password' placeholder='Clave del WiFi'>";
+  html += "<button type='submit'>Guardar WiFi y reiniciar</button>";
+  html += "</form>";
+
+  html += "<h2>Acciones</h2>";
+  html += "<a class='btn secondary' href='/collection'>Registrar recaudacion</a>";
+  html += "<a class='btn secondary' href='/test-pulse'>Probar pulso relay</a>";
+  html += "<a class='btn secondary' href='/reboot'>Reiniciar ESP</a>";
+  html += "<a class='btn danger' href='/clear'>Borrar WiFi guardado</a>";
+
+  html += "<div class='mini'>";
+  html += "Para cambiar el WiFi, conectate a esta red PaySync desde el celular y entra al menu. ";
+  html += "La clave de esta red es: <b>PSync1234</b>.";
+  html += "</div>";
+
+  html += "</div>";
+  html += "</body>";
+  html += "</html>";
+
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleSaveWiFi() {
+  String ssidManual = server.arg("ssid_manual");
+  ssidManual.trim();
+
+  String ssid = ssidManual.length() > 0 ? ssidManual : server.arg("ssid");
+  String pass = server.arg("pass");
+
+  ssid.trim();
+
+  if (ssid.length() == 0) {
+    server.send(400, "text/html; charset=utf-8",
+      "<html><body style='font-family:Arial;background:#080b12;color:white;text-align:center;padding:30px;'>"
+      "<h1>Falta elegir WiFi</h1>"
+      "<a href='/' style='color:#16d9ff;'>Volver</a>"
+      "</body></html>"
+    );
+    return;
+  }
+
+  Serial.println("");
+  Serial.println("Guardando nuevo WiFi...");
+  Serial.print("SSID: ");
+  Serial.println(ssid);
+
+  saveWiFiCredentials(ssid, pass);
+
+  server.send(200, "text/html; charset=utf-8",
+    "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'><meta charset='UTF-8'></head>"
+    "<body style='font-family:Arial;background:#080b12;color:white;text-align:center;padding:30px;'>"
+    "<div style='max-width:420px;margin:auto;background:#111827;border:1px solid #263244;border-radius:20px;padding:24px;'>"
+    "<h1 style='color:#16d9ff;'>WiFi guardado</h1>"
+    "<p>La ESP se va a reiniciar y conectar al nuevo WiFi.</p>"
+    "<p>Espera 20 segundos.</p>"
+    "</div>"
+    "</body></html>"
+  );
+
+  delay(1500);
+  ESP.restart();
+}
+
+void handleClearWiFi() {
+  clearWiFiCredentials();
+
+  server.send(200, "text/html; charset=utf-8",
+    "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'><meta charset='UTF-8'></head>"
+    "<body style='font-family:Arial;background:#080b12;color:white;text-align:center;padding:30px;'>"
+    "<div style='max-width:420px;margin:auto;background:#111827;border:1px solid #263244;border-radius:20px;padding:24px;'>"
+    "<h1 style='color:#f97316;'>WiFi borrado</h1>"
+    "<p>La ESP se va a reiniciar. Luego configura una red nueva.</p>"
+    "</div>"
+    "</body></html>"
+  );
+
+  delay(1500);
+  ESP.restart();
+}
+
+void handleReboot() {
+  server.send(200, "text/html; charset=utf-8",
+    "<html><body style='font-family:Arial;background:#080b12;color:white;text-align:center;padding:30px;'>"
+    "<h1>Reiniciando ESP...</h1>"
+    "</body></html>"
+  );
+
+  delay(1000);
+  ESP.restart();
+}
+
+void handleCollection() {
+  registerCollection();
+
+  server.send(200, "text/html; charset=utf-8",
+    "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'><meta charset='UTF-8'></head>"
+    "<body style='font-family:Arial;background:#080b12;color:white;text-align:center;padding:30px;'>"
+    "<div style='max-width:420px;margin:auto;background:#111827;border:1px solid #263244;border-radius:20px;padding:24px;'>"
+    "<h1 style='color:#22c55e;'>Recaudacion registrada</h1>"
+    "<p>Se envio la recaudacion al panel PaySync.</p>"
+    "<a href='/' style='color:#16d9ff;'>Volver</a>"
+    "</div>"
+    "</body></html>"
+  );
+}
+
+void handleTestPulse() {
+  sendCoinPulse();
+
+  server.send(200, "text/html; charset=utf-8",
+    "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'><meta charset='UTF-8'></head>"
+    "<body style='font-family:Arial;background:#080b12;color:white;text-align:center;padding:30px;'>"
+    "<div style='max-width:420px;margin:auto;background:#111827;border:1px solid #263244;border-radius:20px;padding:24px;'>"
+    "<h1 style='color:#16d9ff;'>Pulso enviado</h1>"
+    "<p>Se activo el relay de credito.</p>"
+    "<a href='/' style='color:#16d9ff;'>Volver</a>"
+    "</div>"
+    "</body></html>"
+  );
+}
+
+void startWebServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSaveWiFi);
+  server.on("/clear", HTTP_GET, handleClearWiFi);
+  server.on("/reboot", HTTP_GET, handleReboot);
+  server.on("/collection", HTTP_GET, handleCollection);
+  server.on("/test-pulse", HTTP_GET, handleTestPulse);
+
+  // Rutas comunes que usan Android/iPhone/Windows para detectar portal cautivo
+  server.on("/generate_204", HTTP_GET, redirectToRoot);
+  server.on("/gen_204", HTTP_GET, redirectToRoot);
+  server.on("/hotspot-detect.html", HTTP_GET, handleRoot);
+  server.on("/library/test/success.html", HTTP_GET, handleRoot);
+  server.on("/connecttest.txt", HTTP_GET, redirectToRoot);
+  server.on("/fwlink", HTTP_GET, redirectToRoot);
+  server.on("/ncsi.txt", HTTP_GET, redirectToRoot);
+
+  server.onNotFound(redirectToRoot);
+
+  server.begin();
+
+  Serial.println("Servidor web local iniciado.");
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("");
+  Serial.println("====================================");
+  Serial.println("PaySync ESP8266 FINAL iniciando");
+  Serial.println("====================================");
+
+  pinMode(RELAY_PIN, OUTPUT);
+  relayOff();
+
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  statusLedSet(false);
+
+  pinMode(BILL_PIN, INPUT_PULLUP);
+  pinMode(COLLECTION_PIN, INPUT_PULLUP);
+
+  EEPROM.begin(EEPROM_SIZE);
+
+  loadWiFiCredentials();
+
+  startAccessPoint();
+  startWebServer();
+
+  bool connected = connectSavedWiFi(20000);
+
+  if (connected) {
+    sendHeartbeat();
+    checkPendingPulse();
+  }
+
+  Serial.println("");
+  Serial.println("Sistema listo.");
+  Serial.print("Menu local: ");
+  Serial.println(AP_SSID);
+  Serial.println("Clave: PSync1234");
+}
+
+// ======================================================
+// LOOP
+// ======================================================
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+
+  updateStatusLed();
+  maintainWiFi();
+
+  unsigned long now = millis();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
+      lastHeartbeat = now;
+      sendHeartbeat();
+    }
+
+    if (now - lastCheckPulse >= CHECK_PULSE_INTERVAL_MS) {
+      lastCheckPulse = now;
+      checkPendingPulse();
+    }
+  }
+
+  int billState = digitalRead(BILL_PIN);
+  bool billActive = BILL_ACTIVE_LOW ? (billState == LOW) : (billState == HIGH);
+
+  if (!lastBillActive && billActive) {
+    if (now - lastBillPulse >= BILL_DEBOUNCE_MS) {
+      lastBillPulse = now;
+      Serial.println("");
+      Serial.println(">>> PULSO BILLETERO DETECTADO");
+      registerBillPulse();
+    }
+  }
+
+  lastBillActive = billActive;
+
+  int collectionState = digitalRead(COLLECTION_PIN);
+  bool collectionActive = COLLECTION_ACTIVE_LOW ? (collectionState == LOW) : (collectionState == HIGH);
+
+  if (!lastCollectionActive && collectionActive) {
+    if (now - lastCollectionPress >= COLLECTION_DEBOUNCE_MS) {
+      lastCollectionPress = now;
+      Serial.println("");
+      Serial.println(">>> BOTON RECAUDACION DETECTADO");
+      registerCollection();
+    }
+  }
+
+  lastCollectionActive = collectionActive;
+
+  delay(10);
+}
+`;
 }
 
 app.get("/", function (req, res) {
@@ -248,6 +1106,7 @@ app.get("/", function (req, res) {
       "GET /admin/create-devices-batch",
       "GET /admin/print-qr",
       "GET /admin/devices-technical",
+      "GET /admin/firmware",
       "GET /pay/:device_code",
       "GET /pay/start/:device_code",
       "POST /mp/webhook"
@@ -642,6 +1501,95 @@ async function createDevicesBatchHandler(req, res) {
 app.get("/admin/create-devices-batch", createDevicesBatchHandler);
 app.post("/admin/create-devices-batch", createDevicesBatchHandler);
 
+app.get("/admin/firmware", async function (req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const deviceCode = getParam(req, ["device", "device_code", "code"]);
+    const download = getParam(req, ["download"], "0");
+
+    if (!deviceCode) {
+      return fail(res, new Error("Missing device code"), 400);
+    }
+
+    const device = await getDeviceTechnical(deviceCode);
+
+    if (!device) {
+      return fail(res, new Error("Device not found"), 404);
+    }
+
+    const firmware = generateEspFirmware(device.device_code, device.device_token);
+    const fileName = "PaySync-" + device.device_code + ".ino";
+
+    if (download === "1" || download === 1 || download === true) {
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.setHeader("Content-Disposition", "attachment; filename=\"" + fileName + "\"");
+      return res.send(firmware);
+    }
+
+    const firmwareUrl =
+      "/admin/firmware?device=" +
+      encodeURIComponent(device.device_code) +
+      "&download=1&key=" +
+      encodeURIComponent(API_KEY);
+
+    return res.send(
+      "<html>" +
+        "<head>" +
+          "<meta name='viewport' content='width=device-width, initial-scale=1.0' />" +
+          "<title>PaySync Firmware - " + escapeHtml(device.device_code) + "</title>" +
+          "<style>" +
+            "body{font-family:Arial,sans-serif;background:#0b1120;color:#e5e7eb;margin:0;padding:24px;}" +
+            ".top{background:#111827;border:1px solid #263244;border-radius:16px;padding:20px;margin-bottom:18px;}" +
+            "h1{margin:0;color:#16d9ff;}" +
+            "p{color:#94a3b8;}" +
+            ".grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:14px;}" +
+            ".card{background:#0f172a;border:1px solid #263244;border-radius:12px;padding:12px;}" +
+            ".label{color:#93c5fd;font-size:12px;margin-bottom:4px;}" +
+            ".value{font-weight:bold;word-break:break-all;}" +
+            ".actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;}" +
+            ".btn{background:#06c8f4;color:#001018;padding:12px 16px;border-radius:10px;text-decoration:none;font-weight:bold;border:0;cursor:pointer;}" +
+            ".secondary{background:#1f2937;color:#e5e7eb;border:1px solid #334155;}" +
+            "textarea{width:100%;height:70vh;background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:14px;padding:16px;font-size:13px;line-height:1.35;box-sizing:border-box;}" +
+            "@media(max-width:700px){.grid{grid-template-columns:1fr;}textarea{height:65vh;font-size:12px;}}" +
+          "</style>" +
+          "<script>" +
+            "function copyFirmware(){" +
+              "var el=document.getElementById('firmware');" +
+              "el.focus();" +
+              "el.select();" +
+              "el.setSelectionRange(0,9999999);" +
+              "navigator.clipboard.writeText(el.value).then(function(){alert('Firmware copiado');}).catch(function(){document.execCommand('copy');alert('Firmware copiado');});" +
+            "}" +
+          "</script>" +
+        "</head>" +
+        "<body>" +
+          "<div class='top'>" +
+            "<h1>Firmware ESP - " + escapeHtml(device.device_code) + "</h1>" +
+            "<p>Codigo Arduino completo listo para cargar en NodeMCU ESP8266.</p>" +
+            "<div class='grid'>" +
+              "<div class='card'><div class='label'>Dispositivo</div><div class='value'>" + escapeHtml(device.device_code) + "</div></div>" +
+              "<div class='card'><div class='label'>Nombre</div><div class='value'>" + escapeHtml(device.visible_name) + "</div></div>" +
+              "<div class='card'><div class='label'>Token secreto</div><div class='value'>" + escapeHtml(device.device_token) + "</div></div>" +
+              "<div class='card'><div class='label'>Precio QR</div><div class='value'>$" + escapeHtml(device.qr_price_ars) + "</div></div>" +
+            "</div>" +
+            "<div class='actions'>" +
+              "<button class='btn' onclick='copyFirmware()'>Copiar firmware completo</button>" +
+              "<a class='btn secondary' href='" + firmwareUrl + "'>Descargar .ino</a>" +
+              "<a class='btn secondary' href='/admin/devices-technical?key=" + encodeURIComponent(API_KEY) + "'>Volver a dispositivos</a>" +
+            "</div>" +
+          "</div>" +
+          "<textarea id='firmware' readonly>" + escapeHtml(firmware) + "</textarea>" +
+        "</body>" +
+      "</html>"
+    );
+  } catch (error) {
+    return fail(res, error);
+  }
+});
+
 app.get("/admin/devices-technical", async function (req, res) {
   try {
     if (!checkApiKey(req)) {
@@ -704,6 +1652,7 @@ app.get("/admin/devices-technical", async function (req, res) {
           "<td><code>" + escapeHtml(token) + "</code></td>" +
           "<td><a href='" + escapeHtml(payUrl) + "' target='_blank'>Abrir QR</a></td>" +
           "<td>" +
+            "<a class='smallbtn' href='/admin/firmware?device=" + encodeURIComponent(code) + "&key=" + encodeURIComponent(API_KEY) + "' target='_blank'>Firmware</a>" +
             "<textarea id='copy_" + i + "' readonly>" + escapeHtml(arduinoBlock) + "</textarea>" +
             "<button onclick='copyText(\"copy_" + i + "\")'>Copiar Arduino</button>" +
           "</td>" +
@@ -728,12 +1677,13 @@ app.get("/admin/devices-technical", async function (req, res) {
             ".actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;}" +
             ".linkbtn{background:#06c8f4;color:#001018;padding:10px 14px;border-radius:10px;text-decoration:none;font-weight:bold;}" +
             ".wrap{overflow-x:auto;background:#111827;border:1px solid #263244;border-radius:16px;}" +
-            "table{width:100%;border-collapse:collapse;min-width:1250px;}" +
+            "table{width:100%;border-collapse:collapse;min-width:1320px;}" +
             "th,td{border-bottom:1px solid #263244;padding:12px;text-align:left;font-size:13px;vertical-align:top;}" +
             "th{background:#0f172a;color:#93c5fd;position:sticky;top:0;}" +
             "code{font-size:12px;color:#facc15;word-break:break-all;}" +
             ".tag{background:#1f2937;border:1px solid #334155;border-radius:999px;padding:4px 8px;font-size:12px;}" +
             "a{color:#38bdf8;}" +
+            ".smallbtn{display:inline-block;background:#06c8f4;color:#001018;padding:8px 10px;border-radius:8px;text-decoration:none;font-weight:bold;margin-bottom:8px;}" +
             "textarea{width:260px;height:58px;background:#020617;color:#f8fafc;border:1px solid #334155;border-radius:10px;padding:8px;font-size:12px;}" +
             "button{display:block;margin-top:6px;background:#06c8f4;color:#001018;border:0;border-radius:8px;padding:8px 10px;font-weight:bold;cursor:pointer;}" +
             "small{color:#94a3b8;}" +
@@ -754,7 +1704,6 @@ app.get("/admin/devices-technical", async function (req, res) {
             "<p>Esta pagina es solo admin. Muestra tokens secretos para programar ESP.</p>" +
             "<div class='actions'>" +
               "<a class='linkbtn' href='/admin/print-qr?key=" + encodeURIComponent(API_KEY) + "'>Ver QR imprimibles</a>" +
-              "<a class='linkbtn' href='/admin/create-devices-batch?start=9&quantity=5&key=" + encodeURIComponent(API_KEY) + "'>Crear lote ejemplo</a>" +
             "</div>" +
           "</div>" +
           "<div class='wrap'>" +
