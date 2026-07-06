@@ -1890,6 +1890,244 @@ app.get("/admin/print-qr", async function (req, res) {
   }
 });
 
+const PLAN_PRICES_ARS = {
+  monthly: 5000,
+  six_months: 25000
+};
+
+function getPlanLabel(planType) {
+  if (planType === "six_months") return "Plan 6 meses";
+  return "Plan mensual";
+}
+
+function getPlanAmount(planType) {
+  return PLAN_PRICES_ARS[planType] || PLAN_PRICES_ARS.monthly;
+}
+
+async function getCompanySummaryByName(companyName) {
+  const data = await supabaseRequest(
+    "/rest/v1/company_dashboard_summary?select=*&company_name=eq." +
+      encodeURIComponent(companyName) +
+      "&limit=1",
+    "GET"
+  );
+
+  if (!data || !Array.isArray(data) || data.length === 0) {
+    return null;
+  }
+
+  return data[0];
+}
+
+app.get("/pay-plan/device/start", async function (req, res) {
+  try {
+    const deviceCode = normalizeDeviceCode(getParam(req, ["device", "device_code", "code"]));
+    const planType = getParam(req, ["plan", "plan_type"], "monthly");
+
+    if (!deviceCode) {
+      return fail(res, new Error("Missing device code"), 400);
+    }
+
+    if (planType !== "monthly" && planType !== "six_months") {
+      return fail(res, new Error("Invalid plan. Use monthly or six_months"), 400);
+    }
+
+    const device = await getDeviceTechnical(deviceCode);
+
+    if (!device) {
+      return fail(res, new Error("Device not found"), 404);
+    }
+
+    const amount = getPlanAmount(planType);
+    const publicBaseUrl = getPublicBaseUrl(req);
+    const externalReference =
+      "PLAN|device|" + device.device_code + "|" + planType + "|" + Date.now();
+
+    const preference = await mercadoPagoRequest(
+      "/checkout/preferences",
+      "POST",
+      {
+        items: [
+          {
+            title: getPlanLabel(planType) + " PaySync - " + device.device_code,
+            description: "Abono PaySync para dispositivo " + device.device_code,
+            quantity: 1,
+            currency_id: "ARS",
+            unit_price: amount
+          }
+        ],
+        external_reference: externalReference,
+        metadata: {
+          payment_type: "plan_subscription",
+          plan_scope: "device",
+          device_code: device.device_code,
+          plan_type: planType,
+          source: "paysync"
+        },
+        notification_url: publicBaseUrl + "/mp/webhook",
+        back_urls: {
+          success: publicBaseUrl + "/pay-plan/success?scope=device&device=" + encodeURIComponent(device.device_code),
+          failure: publicBaseUrl + "/pay-plan/failure?scope=device&device=" + encodeURIComponent(device.device_code),
+          pending: publicBaseUrl + "/pay-plan/pending?scope=device&device=" + encodeURIComponent(device.device_code)
+        },
+        auto_return: "approved"
+      }
+    );
+
+    const checkoutUrl = preference.init_point || preference.sandbox_init_point;
+
+    if (!checkoutUrl) {
+      return fail(res, new Error("Mercado Pago did not return init_point"), 500);
+    }
+
+    if (getParam(req, ["json"], "0") === "1") {
+      return ok(res, {
+        scope: "device",
+        device_code: device.device_code,
+        plan_type: planType,
+        amount: amount,
+        preference_id: preference.id,
+        checkout_url: checkoutUrl,
+        external_reference: externalReference
+      });
+    }
+
+    return res.redirect(checkoutUrl);
+  } catch (error) {
+    return fail(res, error);
+  }
+});
+
+app.get("/pay-plan/company/start", async function (req, res) {
+  try {
+    const companyName = getParam(req, ["company", "company_name", "name"]);
+    const planType = getParam(req, ["plan", "plan_type"], "monthly");
+
+    if (!companyName) {
+      return fail(res, new Error("Missing company name"), 400);
+    }
+
+    if (planType !== "monthly" && planType !== "six_months") {
+      return fail(res, new Error("Invalid plan. Use monthly or six_months"), 400);
+    }
+
+    const company = await getCompanySummaryByName(companyName);
+
+    if (!company) {
+      return fail(res, new Error("Company not found"), 404);
+    }
+
+    const totalDevices = Number(company.total_devices || 0);
+
+    if (!totalDevices || totalDevices <= 0) {
+      return fail(res, new Error("Company has no devices assigned"), 400);
+    }
+
+    const amountPerDevice = getPlanAmount(planType);
+    const amount = amountPerDevice * totalDevices;
+
+    const publicBaseUrl = getPublicBaseUrl(req);
+    const externalReference =
+      "PLAN|company|" + company.company_name + "|" + planType + "|" + Date.now();
+
+    const preference = await mercadoPagoRequest(
+      "/checkout/preferences",
+      "POST",
+      {
+        items: [
+          {
+            title: getPlanLabel(planType) + " PaySync - " + company.company_name,
+            description:
+              "Abono PaySync para " +
+              totalDevices +
+              " dispositivo/s de " +
+              company.company_name,
+            quantity: 1,
+            currency_id: "ARS",
+            unit_price: amount
+          }
+        ],
+        external_reference: externalReference,
+        metadata: {
+          payment_type: "plan_subscription",
+          plan_scope: "company",
+          company_name: company.company_name,
+          plan_type: planType,
+          devices_count: totalDevices,
+          source: "paysync"
+        },
+        notification_url: publicBaseUrl + "/mp/webhook",
+        back_urls: {
+          success: publicBaseUrl + "/pay-plan/success?scope=company&company=" + encodeURIComponent(company.company_name),
+          failure: publicBaseUrl + "/pay-plan/failure?scope=company&company=" + encodeURIComponent(company.company_name),
+          pending: publicBaseUrl + "/pay-plan/pending?scope=company&company=" + encodeURIComponent(company.company_name)
+        },
+        auto_return: "approved"
+      }
+    );
+
+    const checkoutUrl = preference.init_point || preference.sandbox_init_point;
+
+    if (!checkoutUrl) {
+      return fail(res, new Error("Mercado Pago did not return init_point"), 500);
+    }
+
+    if (getParam(req, ["json"], "0") === "1") {
+      return ok(res, {
+        scope: "company",
+        company_name: company.company_name,
+        devices_count: totalDevices,
+        plan_type: planType,
+        amount_per_device: amountPerDevice,
+        amount: amount,
+        preference_id: preference.id,
+        checkout_url: checkoutUrl,
+        external_reference: externalReference
+      });
+    }
+
+    return res.redirect(checkoutUrl);
+  } catch (error) {
+    return fail(res, error);
+  }
+});
+
+app.get("/pay-plan/success", function (req, res) {
+  const scope = getParam(req, ["scope"], "");
+  const deviceCode = getParam(req, ["device"], "");
+  const companyName = getParam(req, ["company"], "");
+
+  return res.send(paymentStatusPage(
+    "Abono aprobado",
+    "Listo. PaySync va a activar el plan automaticamente cuando Mercado Pago confirme el pago.",
+    scope === "company" ? companyName : deviceCode
+  ));
+});
+
+app.get("/pay-plan/failure", function (req, res) {
+  const scope = getParam(req, ["scope"], "");
+  const deviceCode = getParam(req, ["device"], "");
+  const companyName = getParam(req, ["company"], "");
+
+  return res.send(paymentStatusPage(
+    "Abono rechazado",
+    "No se pudo completar el pago del plan. Podes volver a intentar desde el panel.",
+    scope === "company" ? companyName : deviceCode
+  ));
+});
+
+app.get("/pay-plan/pending", function (req, res) {
+  const scope = getParam(req, ["scope"], "");
+  const deviceCode = getParam(req, ["device"], "");
+  const companyName = getParam(req, ["company"], "");
+
+  return res.send(paymentStatusPage(
+    "Abono pendiente",
+    "Mercado Pago todavia esta procesando el abono. Cuando se apruebe, PaySync activara el plan.",
+    scope === "company" ? companyName : deviceCode
+  ));
+});
+
 app.get("/pay/start/:device_code", async function (req, res) {
   try {
     const deviceCode = normalizeDeviceCode(getParam(req, ["device_code"]));
