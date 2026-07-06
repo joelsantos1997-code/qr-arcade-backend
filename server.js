@@ -247,6 +247,7 @@ app.get("/", function (req, res) {
       "GET /company/activate-plan",
       "GET /admin/create-devices-batch",
       "GET /admin/print-qr",
+      "GET /admin/devices-technical",
       "GET /pay/:device_code",
       "GET /pay/start/:device_code",
       "POST /mp/webhook"
@@ -641,6 +642,148 @@ async function createDevicesBatchHandler(req, res) {
 app.get("/admin/create-devices-batch", createDevicesBatchHandler);
 app.post("/admin/create-devices-batch", createDevicesBatchHandler);
 
+app.get("/admin/devices-technical", async function (req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const fromRaw = getParam(req, ["from", "start"], null);
+    const toRaw = getParam(req, ["to", "end"], null);
+    const statusRaw = getParam(req, ["status"], null);
+
+    let path =
+      "/rest/v1/devices?select=device_code,device_token,visible_name,status,qr_price_ars,pulses_per_payment,bill_pulse_value_ars,subscription_status,subscription_expires_at,created_at&order=device_code.asc&limit=300";
+
+    if (fromRaw) {
+      const fromCode = normalizeDeviceCode(fromRaw);
+      path = path + "&device_code=" + encodeURIComponent("gte." + fromCode);
+    }
+
+    if (toRaw) {
+      const toCode = normalizeDeviceCode(toRaw);
+      path = path + "&device_code=" + encodeURIComponent("lte." + toCode);
+    }
+
+    if (statusRaw) {
+      path = path + "&status=" + encodeURIComponent("eq." + statusRaw);
+    }
+
+    const devices = await supabaseRequest(path, "GET");
+    const publicBaseUrl = getPublicBaseUrl(req);
+
+    let rows = "";
+
+    for (let i = 0; i < devices.length; i++) {
+      const d = devices[i];
+
+      const code = String(d.device_code || "");
+      const token = String(d.device_token || "");
+      const name = String(d.visible_name || "");
+      const status = String(d.status || "");
+      const qrPrice = String(d.qr_price_ars || 0);
+      const pulses = String(d.pulses_per_payment || 1);
+      const billValue = String(d.bill_pulse_value_ars || 0);
+      const subscriptionStatus = String(d.subscription_status || "");
+      const expires = d.subscription_expires_at ? String(d.subscription_expires_at) : "-";
+      const payUrl = publicBaseUrl + "/pay/" + encodeURIComponent(code);
+
+      const arduinoBlock =
+        'const String DEVICE_CODE = "' + code + '";\n' +
+        'const String DEVICE_TOKEN = "' + token + '";';
+
+      rows +=
+        "<tr>" +
+          "<td><b>" + escapeHtml(code) + "</b></td>" +
+          "<td>" + escapeHtml(name) + "</td>" +
+          "<td><span class='tag'>" + escapeHtml(status) + "</span></td>" +
+          "<td>$" + escapeHtml(qrPrice) + "</td>" +
+          "<td>" + escapeHtml(pulses) + "</td>" +
+          "<td>$" + escapeHtml(billValue) + "</td>" +
+          "<td>" + escapeHtml(subscriptionStatus) + "<br><small>" + escapeHtml(expires) + "</small></td>" +
+          "<td><code>" + escapeHtml(token) + "</code></td>" +
+          "<td><a href='" + escapeHtml(payUrl) + "' target='_blank'>Abrir QR</a></td>" +
+          "<td>" +
+            "<textarea id='copy_" + i + "' readonly>" + escapeHtml(arduinoBlock) + "</textarea>" +
+            "<button onclick='copyText(\"copy_" + i + "\")'>Copiar Arduino</button>" +
+          "</td>" +
+        "</tr>";
+    }
+
+    if (!rows) {
+      rows =
+        "<tr><td colspan='10' style='text-align:center;padding:30px;color:#64748b;'>No hay dispositivos para mostrar.</td></tr>";
+    }
+
+    return res.send(
+      "<html>" +
+        "<head>" +
+          "<meta name='viewport' content='width=device-width, initial-scale=1.0' />" +
+          "<title>PaySync - Dispositivos tecnicos</title>" +
+          "<style>" +
+            "body{font-family:Arial,sans-serif;background:#0b1120;color:#e5e7eb;margin:0;padding:24px;}" +
+            ".top{background:#111827;border:1px solid #263244;border-radius:16px;padding:20px;margin-bottom:18px;}" +
+            "h1{margin:0;color:#16d9ff;}" +
+            "p{color:#94a3b8;}" +
+            ".actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;}" +
+            ".linkbtn{background:#06c8f4;color:#001018;padding:10px 14px;border-radius:10px;text-decoration:none;font-weight:bold;}" +
+            ".wrap{overflow-x:auto;background:#111827;border:1px solid #263244;border-radius:16px;}" +
+            "table{width:100%;border-collapse:collapse;min-width:1250px;}" +
+            "th,td{border-bottom:1px solid #263244;padding:12px;text-align:left;font-size:13px;vertical-align:top;}" +
+            "th{background:#0f172a;color:#93c5fd;position:sticky;top:0;}" +
+            "code{font-size:12px;color:#facc15;word-break:break-all;}" +
+            ".tag{background:#1f2937;border:1px solid #334155;border-radius:999px;padding:4px 8px;font-size:12px;}" +
+            "a{color:#38bdf8;}" +
+            "textarea{width:260px;height:58px;background:#020617;color:#f8fafc;border:1px solid #334155;border-radius:10px;padding:8px;font-size:12px;}" +
+            "button{display:block;margin-top:6px;background:#06c8f4;color:#001018;border:0;border-radius:8px;padding:8px 10px;font-weight:bold;cursor:pointer;}" +
+            "small{color:#94a3b8;}" +
+          "</style>" +
+          "<script>" +
+            "function copyText(id){" +
+              "var el=document.getElementById(id);" +
+              "el.select();" +
+              "el.setSelectionRange(0,99999);" +
+              "navigator.clipboard.writeText(el.value).then(function(){alert('Copiado');}).catch(function(){document.execCommand('copy');alert('Copiado');});" +
+            "}" +
+          "</script>" +
+        "</head>" +
+        "<body>" +
+          "<div class='top'>" +
+            "<h1>PaySync - Dispositivos tecnicos</h1>" +
+            "<p>Total mostrados: <b>" + devices.length + "</b></p>" +
+            "<p>Esta pagina es solo admin. Muestra tokens secretos para programar ESP.</p>" +
+            "<div class='actions'>" +
+              "<a class='linkbtn' href='/admin/print-qr?key=" + encodeURIComponent(API_KEY) + "'>Ver QR imprimibles</a>" +
+              "<a class='linkbtn' href='/admin/create-devices-batch?start=9&quantity=5&key=" + encodeURIComponent(API_KEY) + "'>Crear lote ejemplo</a>" +
+            "</div>" +
+          "</div>" +
+          "<div class='wrap'>" +
+            "<table>" +
+              "<thead>" +
+                "<tr>" +
+                  "<th>Codigo</th>" +
+                  "<th>Nombre</th>" +
+                  "<th>Estado</th>" +
+                  "<th>Precio QR</th>" +
+                  "<th>Pulsos</th>" +
+                  "<th>Billetero</th>" +
+                  "<th>Plan</th>" +
+                  "<th>Token secreto</th>" +
+                  "<th>Link</th>" +
+                  "<th>Arduino</th>" +
+                "</tr>" +
+              "</thead>" +
+              "<tbody>" + rows + "</tbody>" +
+            "</table>" +
+          "</div>" +
+        "</body>" +
+      "</html>"
+    );
+  } catch (error) {
+    return fail(res, error);
+  }
+});
+
 app.get("/admin/print-qr", async function (req, res) {
   try {
     if (!checkApiKey(req)) {
@@ -669,7 +812,6 @@ app.get("/admin/print-qr", async function (req, res) {
     }
 
     const devices = await supabaseRequest(path, "GET");
-
     const publicBaseUrl = getPublicBaseUrl(req);
 
     let cardsHtml = "";
