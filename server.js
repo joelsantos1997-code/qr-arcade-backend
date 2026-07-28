@@ -14,7 +14,7 @@ const API_KEY = String(process.env.API_KEY || "Laluna123").trim();
 const MP_ACCESS_TOKEN = String(process.env.MP_ACCESS_TOKEN || "").trim();
 
 let SUPABASE_URL = String(
-  process.env.SUPABASE_URL || "https://lrsladmyfriundetnnjw.supabase.co/rest/v1/"
+  process.env.SUPABASE_URL || "https://lrsladmyfriundetnnjw.supabase.co"
 ).trim();
 
 const SUPABASE_SERVICE_ROLE_KEY = String(
@@ -32,6 +32,11 @@ if (SUPABASE_URL.endsWith("/rest/v1")) {
 while (SUPABASE_URL.endsWith("/")) {
   SUPABASE_URL = SUPABASE_URL.substring(0, SUPABASE_URL.length - 1);
 }
+
+const PLAN_PRICES_ARS = {
+  monthly: 5000,
+  six_months: 25000
+};
 
 function getParam(req, names, fallback) {
   if (fallback === undefined) fallback = null;
@@ -197,6 +202,15 @@ async function mercadoPagoRequest(path, method, bodyObject) {
   return data;
 }
 
+function getPlanLabel(planType) {
+  if (planType === "six_months") return "Plan 6 meses";
+  return "Plan mensual";
+}
+
+function getPlanAmount(planType) {
+  return PLAN_PRICES_ARS[planType] || PLAN_PRICES_ARS.monthly;
+}
+
 async function getDeviceFromSummary(deviceCode) {
   const normalizedCode = normalizeDeviceCode(deviceCode);
   const path =
@@ -216,11 +230,26 @@ async function getDeviceTechnical(deviceCode) {
   const normalizedCode = normalizeDeviceCode(deviceCode);
 
   const path =
-    "/rest/v1/devices?select=device_code,device_token,visible_name,status,qr_price_ars,pulses_per_payment,bill_pulse_value_ars,subscription_status,subscription_expires_at&device_code=eq." +
+    "/rest/v1/devices?select=device_code,device_token,visible_name,status,qr_price_ars,pulses_per_payment,bill_pulse_value_ars,coin_pulse_value_ars,subscription_status,subscription_expires_at&device_code=eq." +
     encodeURIComponent(normalizedCode) +
     "&limit=1";
 
   const data = await supabaseRequest(path, "GET");
+
+  if (!data || !Array.isArray(data) || data.length === 0) {
+    return null;
+  }
+
+  return data[0];
+}
+
+async function getCompanySummaryByName(companyName) {
+  const data = await supabaseRequest(
+    "/rest/v1/company_dashboard_summary?select=*&company_name=eq." +
+      encodeURIComponent(companyName) +
+      "&limit=1",
+    "GET"
+  );
 
   if (!data || !Array.isArray(data) || data.length === 0) {
     return null;
@@ -292,20 +321,10 @@ const int RELAY_PIN = D5;        // Rele de credito / coin
 const int BILL_PIN = D2;         // Entrada billetero con optoacoplador
 const int COLLECTION_PIN = D7;   // Boton fisico de recaudacion
 
-// LED testigo.
-// En NodeMCU el LED interno suele ser LED_BUILTIN / D4.
-// Si tu LED testigo externo esta en otro pin, cambia esta linea.
 const int STATUS_LED_PIN = LED_BUILTIN;
 
-// Muchos reles de Arduino activan con LOW.
-// Si tu rele queda prendido al reves, cambia true por false.
 const bool RELAY_ACTIVE_LOW = true;
-
-// LED interno NodeMCU normalmente activa con LOW.
 const bool STATUS_LED_ACTIVE_LOW = true;
-
-// Entradas con INPUT_PULLUP.
-// Con opto o boton a GND, el pulso activo es LOW.
 const bool BILL_ACTIVE_LOW = true;
 const bool COLLECTION_ACTIVE_LOW = true;
 
@@ -965,7 +984,6 @@ void startWebServer() {
   server.on("/collection", HTTP_GET, handleCollection);
   server.on("/test-pulse", HTTP_GET, handleTestPulse);
 
-  // Rutas comunes que usan Android/iPhone/Windows para detectar portal cautivo
   server.on("/generate_204", HTTP_GET, redirectToRoot);
   server.on("/gen_204", HTTP_GET, redirectToRoot);
   server.on("/hotspot-detect.html", HTTP_GET, handleRoot);
@@ -1105,11 +1123,21 @@ app.get("/", function (req, res) {
       "GET /company/activate-plan",
       "GET /admin/create-devices-batch",
       "GET /admin/update-device-config",
+      "GET /admin/companies",
+      "GET /admin/company-devices",
+      "GET /admin/upsert-company",
+      "GET /admin/assign-device",
+      "GET /admin/unassign-device",
+      "GET /admin/plan-payments",
       "GET /admin/print-qr",
       "GET /admin/devices-technical",
       "GET /admin/firmware",
+      "GET /test/qr-approved",
+      "GET /test/plan-approved",
       "GET /pay/:device_code",
       "GET /pay/start/:device_code",
+      "GET /pay-plan/device/start",
+      "GET /pay-plan/company/start",
       "POST /mp/webhook"
     ]
   });
@@ -1265,7 +1293,7 @@ app.get("/device/live-status", async function (req, res) {
     let path = "/rest/v1/device_live_status?select=*";
 
     if (deviceCode) {
-      path = path + "&device_code=eq." + encodeURIComponent(deviceCode);
+      path = path + "&device_code=eq." + encodeURIComponent(normalizeDeviceCode(deviceCode));
     }
 
     const data = await supabaseRequest(path, "GET");
@@ -1282,7 +1310,7 @@ app.get("/device/summary", async function (req, res) {
     let path = "/rest/v1/device_dashboard_summary?select=*";
 
     if (deviceCode) {
-      path = path + "&device_code=eq." + encodeURIComponent(deviceCode);
+      path = path + "&device_code=eq." + encodeURIComponent(normalizeDeviceCode(deviceCode));
     }
 
     const data = await supabaseRequest(path, "GET");
@@ -1543,6 +1571,305 @@ async function updateDeviceConfigHandler(req, res) {
 app.get("/admin/update-device-config", updateDeviceConfigHandler);
 app.post("/admin/update-device-config", updateDeviceConfigHandler);
 
+app.get("/admin/companies", async function (req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const data = await supabaseRequest(
+      "/rest/v1/company_dashboard_summary?select=*&order=company_name.asc",
+      "GET"
+    );
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+});
+
+app.get("/admin/company-devices", async function (req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const companyName = getParam(req, ["company", "company_name"], null);
+    const companyId = getParam(req, ["company_id"], null);
+
+    let resolvedCompanyId = companyId;
+
+    if (!resolvedCompanyId) {
+      if (!companyName) {
+        return fail(res, new Error("Missing company or company_id"), 400);
+      }
+
+      const companies = await supabaseRequest(
+        "/rest/v1/companies?select=id,name,contact_email,status&name=eq." +
+          encodeURIComponent(companyName) +
+          "&limit=1",
+        "GET"
+      );
+
+      if (!companies || !Array.isArray(companies) || companies.length === 0) {
+        return fail(res, new Error("Company not found"), 404);
+      }
+
+      resolvedCompanyId = companies[0].id;
+    }
+
+    const devices = await supabaseRequest(
+      "/rest/v1/devices?select=device_code,visible_name,status,qr_price_ars,pulses_per_payment,bill_pulse_value_ars,coin_pulse_value_ars,subscription_status,subscription_expires_at,last_seen_at,wifi_rssi,firmware_version&company_id=eq." +
+        encodeURIComponent(resolvedCompanyId) +
+        "&order=device_code.asc",
+      "GET"
+    );
+
+    return ok(res, {
+      company_id: resolvedCompanyId,
+      devices: devices
+    });
+  } catch (error) {
+    return fail(res, error);
+  }
+});
+
+async function upsertCompanyHandler(req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const companyName = getParam(req, ["company", "company_name", "name"]);
+    const companyEmail = getParam(req, ["email", "company_email"], null);
+    const companyStatus = getParam(req, ["status", "company_status"], "active");
+
+    if (!companyName) {
+      return fail(res, new Error("Missing company name"), 400);
+    }
+
+    const data = await callRpc("upsert_company_by_name", {
+      p_company_name: companyName,
+      p_company_email: companyEmail,
+      p_company_status: companyStatus
+    });
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/admin/upsert-company", upsertCompanyHandler);
+app.post("/admin/upsert-company", upsertCompanyHandler);
+
+async function assignDeviceHandler(req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const deviceCode = getParam(req, ["device", "device_code", "code"]);
+    const companyName = getParam(req, ["company", "company_name"]);
+    const companyEmail = getParam(req, ["email", "company_email"], null);
+    const forceRaw = getParam(req, ["force", "force_reassign"], "true");
+
+    if (!deviceCode) {
+      return fail(res, new Error("Missing device code"), 400);
+    }
+
+    if (!companyName) {
+      return fail(res, new Error("Missing company name"), 400);
+    }
+
+    const forceReassign =
+      forceRaw === true ||
+      forceRaw === "true" ||
+      forceRaw === "1";
+
+    const data = await callRpc("admin_assign_device_to_company", {
+      p_device_code: deviceCode,
+      p_company_name: companyName,
+      p_company_email: companyEmail,
+      p_force_reassign: forceReassign
+    });
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/admin/assign-device", assignDeviceHandler);
+app.post("/admin/assign-device", assignDeviceHandler);
+
+async function unassignDeviceHandler(req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const deviceCode = getParam(req, ["device", "device_code", "code"]);
+
+    if (!deviceCode) {
+      return fail(res, new Error("Missing device code"), 400);
+    }
+
+    const data = await callRpc("admin_unassign_device_by_code", {
+      p_device_code: deviceCode
+    });
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/admin/unassign-device", unassignDeviceHandler);
+app.post("/admin/unassign-device", unassignDeviceHandler);
+
+app.get("/admin/plan-payments", async function (req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const scope = getParam(req, ["scope"], null);
+    const deviceCode = getParam(req, ["device", "device_code"], null);
+    const companyName = getParam(req, ["company", "company_name"], null);
+
+    let path =
+      "/rest/v1/plan_payments?select=*&order=created_at.desc&limit=200";
+
+    if (scope) {
+      path += "&scope=eq." + encodeURIComponent(scope);
+    }
+
+    if (deviceCode) {
+      path += "&device_code=eq." + encodeURIComponent(normalizeDeviceCode(deviceCode));
+    }
+
+    if (companyName) {
+      path += "&company_name=eq." + encodeURIComponent(companyName);
+    }
+
+    const data = await supabaseRequest(path, "GET");
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+});
+
+async function testPlanApprovedHandler(req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const scope = getParam(req, ["scope"], "device");
+    const planType = getParam(req, ["plan", "plan_type"], "monthly");
+
+    if (scope !== "device" && scope !== "company") {
+      return fail(res, new Error("Invalid scope. Use device or company"), 400);
+    }
+
+    if (planType !== "monthly" && planType !== "six_months") {
+      return fail(res, new Error("Invalid plan. Use monthly or six_months"), 400);
+    }
+
+    const amount = getPlanAmount(planType);
+    const paymentId =
+      "PLAN-TEST-" +
+      scope +
+      "-" +
+      planType +
+      "-" +
+      Date.now() +
+      "-" +
+      Math.floor(Math.random() * 999999);
+
+    const preferenceId = "PREF-" + paymentId;
+
+    if (scope === "device") {
+      const deviceCode = normalizeDeviceCode(
+        getParam(req, ["device", "device_code", "code"])
+      );
+
+      if (!deviceCode) {
+        return fail(res, new Error("Missing device code"), 400);
+      }
+
+      const data = await callRpc("register_device_plan_payment_by_code", {
+        p_device_code: deviceCode,
+        p_plan_type: planType,
+        p_mp_payment_id: paymentId,
+        p_mp_preference_id: preferenceId,
+        p_external_reference: "PLAN|device|" + deviceCode + "|" + planType + "|" + Date.now(),
+        p_amount_ars: amount
+      });
+
+      return ok(res, {
+        message: "Pago de abono simulado para dispositivo",
+        scope: scope,
+        device_code: deviceCode,
+        plan_type: planType,
+        amount_ars: amount,
+        payment_id: paymentId,
+        result: data
+      });
+    }
+
+    if (scope === "company") {
+      const companyName = getParam(req, ["company", "company_name", "name"]);
+
+      if (!companyName) {
+        return fail(res, new Error("Missing company name"), 400);
+      }
+
+      const company = await getCompanySummaryByName(companyName);
+
+      if (!company) {
+        return fail(res, new Error("Company not found"), 404);
+      }
+
+      const totalDevices = Number(company.total_devices || 0);
+
+      if (!totalDevices || totalDevices <= 0) {
+        return fail(res, new Error("Company has no devices assigned"), 400);
+      }
+
+      const totalAmount = amount * totalDevices;
+
+      const data = await callRpc("register_company_plan_payment_by_name", {
+        p_company_name: company.company_name,
+        p_plan_type: planType,
+        p_mp_payment_id: paymentId,
+        p_mp_preference_id: preferenceId,
+        p_external_reference: "PLAN|company|" + company.company_name + "|" + planType + "|" + Date.now(),
+        p_amount_ars: totalAmount
+      });
+
+      return ok(res, {
+        message: "Pago de abono simulado para empresa",
+        scope: scope,
+        company_name: company.company_name,
+        devices_count: totalDevices,
+        plan_type: planType,
+        amount_per_device_ars: amount,
+        amount_ars: totalAmount,
+        payment_id: paymentId,
+        result: data
+      });
+    }
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/test/plan-approved", testPlanApprovedHandler);
+app.post("/test/plan-approved", testPlanApprovedHandler);
+
 app.get("/admin/firmware", async function (req, res) {
   try {
     if (!checkApiKey(req)) {
@@ -1643,7 +1970,7 @@ app.get("/admin/devices-technical", async function (req, res) {
     const statusRaw = getParam(req, ["status"], null);
 
     let path =
-      "/rest/v1/devices?select=device_code,device_token,visible_name,status,qr_price_ars,pulses_per_payment,bill_pulse_value_ars,subscription_status,subscription_expires_at,created_at&order=device_code.asc&limit=300";
+      "/rest/v1/devices?select=device_code,device_token,visible_name,status,qr_price_ars,pulses_per_payment,bill_pulse_value_ars,coin_pulse_value_ars,subscription_status,subscription_expires_at,created_at&order=device_code.asc&limit=300";
 
     if (fromRaw) {
       const fromCode = normalizeDeviceCode(fromRaw);
@@ -1674,6 +2001,7 @@ app.get("/admin/devices-technical", async function (req, res) {
       const qrPrice = String(d.qr_price_ars || 0);
       const pulses = String(d.pulses_per_payment || 1);
       const billValue = String(d.bill_pulse_value_ars || 0);
+      const coinValue = String(d.coin_pulse_value_ars || 0);
       const subscriptionStatus = String(d.subscription_status || "");
       const expires = d.subscription_expires_at ? String(d.subscription_expires_at) : "-";
       const payUrl = publicBaseUrl + "/pay/" + encodeURIComponent(code);
@@ -1690,6 +2018,7 @@ app.get("/admin/devices-technical", async function (req, res) {
           "<td>$" + escapeHtml(qrPrice) + "</td>" +
           "<td>" + escapeHtml(pulses) + "</td>" +
           "<td>$" + escapeHtml(billValue) + "</td>" +
+          "<td>$" + escapeHtml(coinValue) + "</td>" +
           "<td>" + escapeHtml(subscriptionStatus) + "<br><small>" + escapeHtml(expires) + "</small></td>" +
           "<td><code>" + escapeHtml(token) + "</code></td>" +
           "<td><a href='" + escapeHtml(payUrl) + "' target='_blank'>Abrir QR</a></td>" +
@@ -1703,7 +2032,7 @@ app.get("/admin/devices-technical", async function (req, res) {
 
     if (!rows) {
       rows =
-        "<tr><td colspan='10' style='text-align:center;padding:30px;color:#64748b;'>No hay dispositivos para mostrar.</td></tr>";
+        "<tr><td colspan='11' style='text-align:center;padding:30px;color:#64748b;'>No hay dispositivos para mostrar.</td></tr>";
     }
 
     return res.send(
@@ -1719,7 +2048,7 @@ app.get("/admin/devices-technical", async function (req, res) {
             ".actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;}" +
             ".linkbtn{background:#06c8f4;color:#001018;padding:10px 14px;border-radius:10px;text-decoration:none;font-weight:bold;}" +
             ".wrap{overflow-x:auto;background:#111827;border:1px solid #263244;border-radius:16px;}" +
-            "table{width:100%;border-collapse:collapse;min-width:1320px;}" +
+            "table{width:100%;border-collapse:collapse;min-width:1420px;}" +
             "th,td{border-bottom:1px solid #263244;padding:12px;text-align:left;font-size:13px;vertical-align:top;}" +
             "th{background:#0f172a;color:#93c5fd;position:sticky;top:0;}" +
             "code{font-size:12px;color:#facc15;word-break:break-all;}" +
@@ -1758,6 +2087,7 @@ app.get("/admin/devices-technical", async function (req, res) {
                   "<th>Precio QR</th>" +
                   "<th>Pulsos</th>" +
                   "<th>Billetero</th>" +
+                  "<th>Monedero</th>" +
                   "<th>Plan</th>" +
                   "<th>Token secreto</th>" +
                   "<th>Link</th>" +
@@ -1889,35 +2219,6 @@ app.get("/admin/print-qr", async function (req, res) {
     return fail(res, error);
   }
 });
-
-const PLAN_PRICES_ARS = {
-  monthly: 5000,
-  six_months: 25000
-};
-
-function getPlanLabel(planType) {
-  if (planType === "six_months") return "Plan 6 meses";
-  return "Plan mensual";
-}
-
-function getPlanAmount(planType) {
-  return PLAN_PRICES_ARS[planType] || PLAN_PRICES_ARS.monthly;
-}
-
-async function getCompanySummaryByName(companyName) {
-  const data = await supabaseRequest(
-    "/rest/v1/company_dashboard_summary?select=*&company_name=eq." +
-      encodeURIComponent(companyName) +
-      "&limit=1",
-    "GET"
-  );
-
-  if (!data || !Array.isArray(data) || data.length === 0) {
-    return null;
-  }
-
-  return data[0];
-}
 
 app.get("/pay-plan/device/start", async function (req, res) {
   try {
@@ -2481,303 +2782,7 @@ app.get("/pay/:device_code", async function (req, res) {
     return fail(res, error);
   }
 });
-app.get("/admin/companies", async function (req, res) {
-  try {
-    if (!checkApiKey(req)) {
-      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
-    }
 
-    const data = await supabaseRequest(
-      "/rest/v1/company_dashboard_summary?select=*&order=company_name.asc",
-      "GET"
-    );
-
-    return ok(res, data);
-  } catch (error) {
-    return fail(res, error);
-  }
-});
-
-app.get("/admin/company-devices", async function (req, res) {
-  try {
-    if (!checkApiKey(req)) {
-      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
-    }
-
-    const companyName = getParam(req, ["company", "company_name"], null);
-    const companyId = getParam(req, ["company_id"], null);
-
-    let resolvedCompanyId = companyId;
-
-    if (!resolvedCompanyId) {
-      if (!companyName) {
-        return fail(res, new Error("Missing company or company_id"), 400);
-      }
-
-      const companies = await supabaseRequest(
-        "/rest/v1/companies?select=id,name,contact_email,status&name=eq." +
-          encodeURIComponent(companyName) +
-          "&limit=1",
-        "GET"
-      );
-
-      if (!companies || !Array.isArray(companies) || companies.length === 0) {
-        return fail(res, new Error("Company not found"), 404);
-      }
-
-      resolvedCompanyId = companies[0].id;
-    }
-
-    const devices = await supabaseRequest(
-      "/rest/v1/devices?select=device_code,visible_name,status,qr_price_ars,pulses_per_payment,bill_pulse_value_ars,coin_pulse_value_ars,subscription_status,subscription_expires_at,last_seen_at,wifi_rssi,firmware_version&company_id=eq." +
-        encodeURIComponent(resolvedCompanyId) +
-        "&order=device_code.asc",
-      "GET"
-    );
-
-    return ok(res, {
-      company_id: resolvedCompanyId,
-      devices: devices
-    });
-  } catch (error) {
-    return fail(res, error);
-  }
-});
-
-async function upsertCompanyHandler(req, res) {
-  try {
-    if (!checkApiKey(req)) {
-      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
-    }
-
-    const companyName = getParam(req, ["company", "company_name", "name"]);
-    const companyEmail = getParam(req, ["email", "company_email"], null);
-    const companyStatus = getParam(req, ["status", "company_status"], "active");
-
-    if (!companyName) {
-      return fail(res, new Error("Missing company name"), 400);
-    }
-
-    const data = await callRpc("upsert_company_by_name", {
-      p_company_name: companyName,
-      p_company_email: companyEmail,
-      p_company_status: companyStatus
-    });
-
-    return ok(res, data);
-  } catch (error) {
-    return fail(res, error);
-  }
-}
-
-app.get("/admin/upsert-company", upsertCompanyHandler);
-app.post("/admin/upsert-company", upsertCompanyHandler);
-
-async function assignDeviceHandler(req, res) {
-  try {
-    if (!checkApiKey(req)) {
-      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
-    }
-
-    const deviceCode = getParam(req, ["device", "device_code", "code"]);
-    const companyName = getParam(req, ["company", "company_name"]);
-    const companyEmail = getParam(req, ["email", "company_email"], null);
-    const forceRaw = getParam(req, ["force", "force_reassign"], "true");
-
-    if (!deviceCode) {
-      return fail(res, new Error("Missing device code"), 400);
-    }
-
-    if (!companyName) {
-      return fail(res, new Error("Missing company name"), 400);
-    }
-
-    const forceReassign =
-      forceRaw === true ||
-      forceRaw === "true" ||
-      forceRaw === "1";
-
-    const data = await callRpc("admin_assign_device_to_company", {
-      p_device_code: deviceCode,
-      p_company_name: companyName,
-      p_company_email: companyEmail,
-      p_force_reassign: forceReassign
-    });
-
-    return ok(res, data);
-  } catch (error) {
-    return fail(res, error);
-  }
-}
-
-app.get("/admin/assign-device", assignDeviceHandler);
-app.post("/admin/assign-device", assignDeviceHandler);
-
-async function unassignDeviceHandler(req, res) {
-  try {
-    if (!checkApiKey(req)) {
-      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
-    }
-
-    const deviceCode = getParam(req, ["device", "device_code", "code"]);
-
-    if (!deviceCode) {
-      return fail(res, new Error("Missing device code"), 400);
-    }
-
-    const data = await callRpc("admin_unassign_device_by_code", {
-      p_device_code: deviceCode
-    });
-
-    return ok(res, data);
-  } catch (error) {
-    return fail(res, error);
-  }
-}
-
-app.get("/admin/unassign-device", unassignDeviceHandler);
-app.post("/admin/unassign-device", unassignDeviceHandler);
-app.get("/admin/plan-payments", async function (req, res) {
-  try {
-    if (!checkApiKey(req)) {
-      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
-    }
-
-    const scope = getParam(req, ["scope"], null);
-    const deviceCode = getParam(req, ["device", "device_code"], null);
-    const companyName = getParam(req, ["company", "company_name"], null);
-
-    let path =
-      "/rest/v1/plan_payments?select=*&order=created_at.desc&limit=200";
-
-    if (scope) {
-      path += "&scope=eq." + encodeURIComponent(scope);
-    }
-
-    if (deviceCode) {
-      path += "&device_code=eq." + encodeURIComponent(normalizeDeviceCode(deviceCode));
-    }
-
-    if (companyName) {
-      path += "&company_name=eq." + encodeURIComponent(companyName);
-    }
-
-    const data = await supabaseRequest(path, "GET");
-
-    return ok(res, data);
-  } catch (error) {
-    return fail(res, error);
-  }
-});
-
-async function testPlanApprovedHandler(req, res) {
-  try {
-    if (!checkApiKey(req)) {
-      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
-    }
-
-    const scope = getParam(req, ["scope"], "device");
-    const planType = getParam(req, ["plan", "plan_type"], "monthly");
-
-    if (scope !== "device" && scope !== "company") {
-      return fail(res, new Error("Invalid scope. Use device or company"), 400);
-    }
-
-    if (planType !== "monthly" && planType !== "six_months") {
-      return fail(res, new Error("Invalid plan. Use monthly or six_months"), 400);
-    }
-
-    const amount = getPlanAmount(planType);
-    const paymentId =
-      "PLAN-TEST-" +
-      scope +
-      "-" +
-      planType +
-      "-" +
-      Date.now() +
-      "-" +
-      Math.floor(Math.random() * 999999);
-
-    const preferenceId = "PREF-" + paymentId;
-
-    if (scope === "device") {
-      const deviceCode = normalizeDeviceCode(
-        getParam(req, ["device", "device_code", "code"])
-      );
-
-      if (!deviceCode) {
-        return fail(res, new Error("Missing device code"), 400);
-      }
-
-      const data = await callRpc("register_device_plan_payment_by_code", {
-        p_device_code: deviceCode,
-        p_plan_type: planType,
-        p_mp_payment_id: paymentId,
-        p_mp_preference_id: preferenceId,
-        p_external_reference: "PLAN|device|" + deviceCode + "|" + planType + "|" + Date.now(),
-        p_amount_ars: amount
-      });
-
-      return ok(res, {
-        message: "Pago de abono simulado para dispositivo",
-        scope: scope,
-        device_code: deviceCode,
-        plan_type: planType,
-        amount_ars: amount,
-        payment_id: paymentId,
-        result: data
-      });
-    }
-
-    if (scope === "company") {
-      const companyName = getParam(req, ["company", "company_name", "name"]);
-
-      if (!companyName) {
-        return fail(res, new Error("Missing company name"), 400);
-      }
-
-      const company = await getCompanySummaryByName(companyName);
-
-      if (!company) {
-        return fail(res, new Error("Company not found"), 404);
-      }
-
-      const totalDevices = Number(company.total_devices || 0);
-
-      if (!totalDevices || totalDevices <= 0) {
-        return fail(res, new Error("Company has no devices assigned"), 400);
-      }
-
-      const totalAmount = amount * totalDevices;
-
-      const data = await callRpc("register_company_plan_payment_by_name", {
-        p_company_name: company.company_name,
-        p_plan_type: planType,
-        p_mp_payment_id: paymentId,
-        p_mp_preference_id: preferenceId,
-        p_external_reference: "PLAN|company|" + company.company_name + "|" + planType + "|" + Date.now(),
-        p_amount_ars: totalAmount
-      });
-
-      return ok(res, {
-        message: "Pago de abono simulado para empresa",
-        scope: scope,
-        company_name: company.company_name,
-        devices_count: totalDevices,
-        plan_type: planType,
-        amount_per_device_ars: amount,
-        amount_ars: totalAmount,
-        payment_id: paymentId,
-        result: data
-      });
-    }
-  } catch (error) {
-    return fail(res, error);
-  }
-}
-
-app.get("/test/plan-approved", testPlanApprovedHandler);
-app.post("/test/plan-approved", testPlanApprovedHandler);
 if (require.main === module) {
   app.listen(PORT, function () {
     console.log("PaySync backend running on port " + PORT);
