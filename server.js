@@ -2637,7 +2637,147 @@ async function unassignDeviceHandler(req, res) {
 
 app.get("/admin/unassign-device", unassignDeviceHandler);
 app.post("/admin/unassign-device", unassignDeviceHandler);
+app.get("/admin/plan-payments", async function (req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
 
+    const scope = getParam(req, ["scope"], null);
+    const deviceCode = getParam(req, ["device", "device_code"], null);
+    const companyName = getParam(req, ["company", "company_name"], null);
+
+    let path =
+      "/rest/v1/plan_payments?select=*&order=created_at.desc&limit=200";
+
+    if (scope) {
+      path += "&scope=eq." + encodeURIComponent(scope);
+    }
+
+    if (deviceCode) {
+      path += "&device_code=eq." + encodeURIComponent(normalizeDeviceCode(deviceCode));
+    }
+
+    if (companyName) {
+      path += "&company_name=eq." + encodeURIComponent(companyName);
+    }
+
+    const data = await supabaseRequest(path, "GET");
+
+    return ok(res, data);
+  } catch (error) {
+    return fail(res, error);
+  }
+});
+
+async function testPlanApprovedHandler(req, res) {
+  try {
+    if (!checkApiKey(req)) {
+      return fail(res, new Error("Unauthorized. Invalid API_KEY."), 401);
+    }
+
+    const scope = getParam(req, ["scope"], "device");
+    const planType = getParam(req, ["plan", "plan_type"], "monthly");
+
+    if (scope !== "device" && scope !== "company") {
+      return fail(res, new Error("Invalid scope. Use device or company"), 400);
+    }
+
+    if (planType !== "monthly" && planType !== "six_months") {
+      return fail(res, new Error("Invalid plan. Use monthly or six_months"), 400);
+    }
+
+    const amount = getPlanAmount(planType);
+    const paymentId =
+      "PLAN-TEST-" +
+      scope +
+      "-" +
+      planType +
+      "-" +
+      Date.now() +
+      "-" +
+      Math.floor(Math.random() * 999999);
+
+    const preferenceId = "PREF-" + paymentId;
+
+    if (scope === "device") {
+      const deviceCode = normalizeDeviceCode(
+        getParam(req, ["device", "device_code", "code"])
+      );
+
+      if (!deviceCode) {
+        return fail(res, new Error("Missing device code"), 400);
+      }
+
+      const data = await callRpc("register_device_plan_payment_by_code", {
+        p_device_code: deviceCode,
+        p_plan_type: planType,
+        p_mp_payment_id: paymentId,
+        p_mp_preference_id: preferenceId,
+        p_external_reference: "PLAN|device|" + deviceCode + "|" + planType + "|" + Date.now(),
+        p_amount_ars: amount
+      });
+
+      return ok(res, {
+        message: "Pago de abono simulado para dispositivo",
+        scope: scope,
+        device_code: deviceCode,
+        plan_type: planType,
+        amount_ars: amount,
+        payment_id: paymentId,
+        result: data
+      });
+    }
+
+    if (scope === "company") {
+      const companyName = getParam(req, ["company", "company_name", "name"]);
+
+      if (!companyName) {
+        return fail(res, new Error("Missing company name"), 400);
+      }
+
+      const company = await getCompanySummaryByName(companyName);
+
+      if (!company) {
+        return fail(res, new Error("Company not found"), 404);
+      }
+
+      const totalDevices = Number(company.total_devices || 0);
+
+      if (!totalDevices || totalDevices <= 0) {
+        return fail(res, new Error("Company has no devices assigned"), 400);
+      }
+
+      const totalAmount = amount * totalDevices;
+
+      const data = await callRpc("register_company_plan_payment_by_name", {
+        p_company_name: company.company_name,
+        p_plan_type: planType,
+        p_mp_payment_id: paymentId,
+        p_mp_preference_id: preferenceId,
+        p_external_reference: "PLAN|company|" + company.company_name + "|" + planType + "|" + Date.now(),
+        p_amount_ars: totalAmount
+      });
+
+      return ok(res, {
+        message: "Pago de abono simulado para empresa",
+        scope: scope,
+        company_name: company.company_name,
+        devices_count: totalDevices,
+        plan_type: planType,
+        amount_per_device_ars: amount,
+        amount_ars: totalAmount,
+        payment_id: paymentId,
+        result: data
+      });
+    }
+  } catch (error) {
+    return fail(res, error);
+  }
+}
+
+app.get("/test/plan-approved", testPlanApprovedHandler);
+app.post("/test/plan-approved", testPlanApprovedHandler);
 if (require.main === module) {
   app.listen(PORT, function () {
     console.log("PaySync backend running on port " + PORT);
