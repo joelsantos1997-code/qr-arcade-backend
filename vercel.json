@@ -3,7 +3,8 @@
   "builds": [
     {
       "src": "server.js",
-      "use": "@vercel/node"
+      "use": "@vercel/node",
+      "config": {"includeFiles": ["firmware/paysync-esp8266/PaySyncESP8266.ino"]}
     }
   ],
   "routes": [
