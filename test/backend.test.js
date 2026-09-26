@@ -6,7 +6,7 @@ const {createApp}=require('../server');
 const {generateEspFirmware}=require('../lib/firmware');
 const env={NODE_ENV:'production',API_KEY:'a'.repeat(48),SUPABASE_URL:'https://example.supabase.co/rest/v1/',SUPABASE_SERVICE_ROLE_KEY:'sb_secret_fixture',MP_ACCESS_TOKEN:'fixture-token',MP_WEBHOOK_SECRET:'fixture-webhook',MP_COLLECTOR_ID:'123',MP_ENVIRONMENT:'production',PUBLIC_BASE_URL:'https://pay.example.com',ALLOWED_ORIGINS:'https://panel.example.com',PAYMENTS_ENABLED:'true'};
 const orderId='00000000-0000-4000-8000-000000000001';
-function setup(overrides={},handler=c=>c.url.endsWith('/paysync_schema_version')?'20260926':[]) {
+function setup(overrides={},handler=c=>c.url.endsWith('/paysync_schema_version')?'20260926-device-v1':[]) {
   const calls=[];
   const app=createApp({env:{...env,...overrides},fetchImpl:async(url,options)=>{
     const call={url,options,body:options.body?JSON.parse(options.body):null};calls.push(call);
@@ -37,9 +37,9 @@ test('health fails closed for missing migration and coin routes require credenti
 });
 
 test('status renders actual checks and a short secure session without echoing keys',async()=>{
-  const {app}=setup({},c=>c.url.endsWith('/paysync_schema_version')?'20260926':c.url.includes('last_seen_at=not')?[{last_seen_at:'2026-09-26T12:00:00Z'}]:[]);
+  const {app}=setup({},c=>c.url.endsWith('/paysync_schema_version')?'20260926-device-v1':c.url.includes('last_seen_at=not')?[{last_seen_at:'2026-09-26T12:00:00Z'}]:[]);
   const status=await request(app).get('/admin/status?format=json').set('x-api-key',env.API_KEY);
-  assert.equal(status.status,200);assert.equal(status.body.data.metrics.devices,12);assert.equal(status.body.data.schema,'20260926');
+  assert.equal(status.status,200);assert.equal(status.body.data.metrics.devices,12);assert.equal(status.body.data.schema,'20260926-device-v1');
   assert.equal(status.body.data.configuration.mercado_pago,'configured_not_verified');
   const html=await request(app).get('/admin/status?key='+env.API_KEY);
   assert.equal(html.status,200);assert.ok(html.text.includes('Servicios disponibles'));assert.ok(!html.text.includes(env.API_KEY));assert.ok(!html.text.includes(env.MP_ACCESS_TOKEN));
@@ -50,7 +50,7 @@ test('firmware download and printable QR require admin and never embed the admin
   const device={device_code:'PS-000004',device_token:'fixture-device-secret',visible_name:'<script>bad()</script>',qr_price_ars:150,pulses_per_payment:2};
   const {app}=setup({FIRMWARE_CA_PEM:'-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----'},()=>[device]);
   const fw=await request(app).get('/admin/firmware?device=4&download=1').set('x-api-key',env.API_KEY);
-  assert.equal(fw.status,200);assert.match(fw.headers['content-disposition'],/PaySync-PS-000004\.ino/);assert.ok(fw.text.includes('/device/coin/claim'));assert.ok(!fw.text.includes(env.API_KEY));
+  assert.equal(fw.status,200);assert.match(fw.headers['content-disposition'],/PaySync-PS-000004\.ino/);assert.ok(fw.text.includes('/device/consume-pulse'));assert.ok(!fw.text.includes(env.API_KEY));
   const qr=await request(app).get('/admin/print-qr?device=4').set('x-api-key',env.API_KEY);
   assert.equal(qr.status,200);assert.ok(qr.text.includes('data:image/png;base64,'));assert.ok(!qr.text.includes('<script>bad()'));assert.ok(!qr.text.includes('fixture-device-secret'));assert.ok(!qr.text.includes(env.API_KEY));
 });
@@ -142,10 +142,59 @@ test('CORS rejects unknown origin and malformed JSON returns JSON 400',async()=>
 });
 test('legacy consumption is retired and generated firmware verifies TLS and persists receipts',async()=>{
   const {app}=setup();assert.equal((await request(app).get('/device/consume-pulse')).status,426);
-  assert.throws(()=>generateEspFirmware('PS-000004','secret',{caPem:'',publicUrl:env.PUBLIC_BASE_URL}));
-  const code=generateEspFirmware('PS-000004','secret',{caPem:'-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----',publicUrl:env.PUBLIC_BASE_URL});
+  assert.throws(()=>generateEspFirmware('PS-000004','fixture-device-secret',{caPem:'',publicUrl:env.PUBLIC_BASE_URL}));
+  const code=generateEspFirmware('PS-000004','fixture-device-secret',{caPem:'-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----',publicUrl:env.PUBLIC_BASE_URL});
   assert.ok(!code.includes('setInsecure'));assert.ok(code.includes('setTrustAnchors'));assert.ok(code.includes('/device/coin/ack'));assert.ok(code.includes('EEPROM_SIZE = 512'));assert.ok(!code.includes('body.indexOf("true")'));assert.ok(!code.includes(env.API_KEY));
 });
 test('public success page never activates plans or delivers credits',async()=>{
   const {app,calls}=setup();const r=await request(app).get('/pay/success?status=approved');assert.equal(r.status,200);assert.equal(calls.length,0);assert.ok(!r.text.includes('Pago aprobado'));
+});
+
+test('new consume-pulse requires typed readiness and never uses the legacy dequeue',async()=>{
+  const {app,calls}=setup({},()=>({command:{id:orderId,pulse_duration_ms:180}}));
+  const base={device:'4',token:'fixture-device-token',boot_id:'fixture-boot',protocol:'ack-v1',ready:true};
+  for(const invalid of [{ready:'true'},{boot_id:'bad'},{token:''}])assert.equal((await request(app).post('/device/consume-pulse').send({...base,...invalid})).status,400);
+  assert.equal(calls.length,0);
+  const r=await request(app).post('/device/consume-pulse').send(base);
+  assert.equal(r.status,200);assert.equal(r.body.protocol,'ack-v1');assert.equal(r.body.data.command.id,orderId);
+  assert.ok(calls[0].url.endsWith('/paysync_poll_coin'));assert.equal(calls[0].body.p_device_code,'PS-000004');
+});
+
+test('heartbeat stores bounded telemetry and preserves legacy data while exposing runtime confirmation',async()=>{
+  const {app,calls}=setup({},c=>c.url.endsWith('/paysync_device_telemetry')?{ready:false}:[{device_code:'PS-000004'}]);
+  const base={device:'4',token:'fixture-device-token',boot_id:'fixture-boot',protocol:'ack-v1',ready:false,rssi:-60,firmware:'paysync-esp8266-v1.0.0',uptime_ms:999999,free_heap:35000,pending_events:3,last_error:'none',maintenance:true};
+  for(const invalid of [{uptime_ms:-1},{free_heap:'35000'},{pending_events:129},{last_error:'secret\nvalue'},{maintenance:'true'}])assert.equal((await request(app).post('/device/heartbeat').send({...base,...invalid})).status,400);
+  assert.equal(calls.length,0);
+  const r=await request(app).post('/device/heartbeat').send(base);
+  assert.equal(r.status,200);assert.equal(r.body.runtime.ready,false);assert.equal(r.body.data[0].device_code,'PS-000004');assert.equal(calls[0].body.p_uptime_ms,999999);
+});
+
+test('ack-v1 cash and collection events retain identity and refuse conflicts',async()=>{
+  const base={device:'4',token:'fixture-device-token',protocol:'ack-v1',event_uid:'fixture-event-001',company_id:'10000000-0000-4000-8000-000000000001',source:'billetero',unit_amount_ars:1000};
+  const {app,calls}=setup({},c=>({recorded:true,event_uid:c.body.p_event_uid}));
+  for(const route of ['bill-pulse','register-collection']) {
+    const r=await request(app).post('/device/'+route).send(base);assert.equal(r.status,200);assert.equal(r.body.data.event_uid,base.event_uid);
+    assert.ok(calls.at(-1).url.endsWith('/paysync_record_device_event'));
+  }
+  assert.equal(calls[0].body.p_kind,'billetero');assert.equal(calls[1].body.p_kind,'collection');
+  for(const invalid of [{company_id:''},{event_uid:''},{source:'qr'},{unit_amount_ars:0}])assert.equal((await request(app).post('/device/bill-pulse').send({...base,...invalid})).status,400);
+  const conflict=setup({},()=>({error:'company_changed'}));
+  assert.equal((await request(conflict.app).post('/device/bill-pulse').send(base)).status,409);
+});
+
+test('status distinguishes online count, payment history, device faults and unverified production prerequisites',async()=>{
+  const {app}=setup({},c=>c.url.endsWith('/paysync_schema_version')?'20260926-device-v1':c.url.includes('last_error_at=not')?[{last_error:'receipt_uncertain'}]:c.url.includes('kind=eq.qr')?[{state:'relay_confirmed'}]:c.url.includes('kind=in.')?[{kind:'device_plan'}]:[]);
+  const r=await request(app).get('/admin/status?format=json').set('x-api-key',env.API_KEY);
+  assert.equal(r.status,200);assert.equal(r.body.data.metrics.online_devices,12);
+  assert.equal(r.body.data.metrics.latest_qr_payments[0].state,'relay_confirmed');assert.equal(r.body.data.metrics.latest_plan_payments[0].kind,'device_plan');
+  assert.equal(r.body.data.metrics.recent_device_errors[0].last_error,'receipt_uncertain');assert.ok(r.body.data.production_warnings.some(w=>w.code==='physical_credit_unverified'));
+  assert.ok(!r.text.includes('fixture-token'));
+});
+
+test('per-device template safely quotes provisioning and does not recursively substitute token content',()=>{
+  const token='fake-"-\\-{{PAYSYNC_CA_PEM}}-secret';
+  const code=generateEspFirmware('PS-000004',token,{publicUrl:env.PUBLIC_BASE_URL,caPem:'-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----'});
+  const literal=code.match(/const char DEVICE_TOKEN\[\] = (.*);/)[1];assert.equal(JSON.parse(literal),token);
+  assert.throws(()=>generateEspFirmware('PS-000004',token,{publicUrl:'http://example.com',caPem:'-----BEGIN CERTIFICATE-----'}));
+  assert.throws(()=>generateEspFirmware('BAD',token,{publicUrl:env.PUBLIC_BASE_URL,caPem:'-----BEGIN CERTIFICATE-----'}));
 });

@@ -6,3 +6,7 @@ node_modules/
 coverage/
 *.log
 backups/
+# Generated firmware contains a device secret; keep provisioning outside Git.
+provisioned/
+*.bin
+*.elf

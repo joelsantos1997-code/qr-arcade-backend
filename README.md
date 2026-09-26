@@ -11,7 +11,7 @@ Esta rama prepara el backend, la migración y el firmware. **No habilitar ventas
 - La placa conserva un recibo en EEPROM y confirma cada comando. Ante un corte ambiguo se bloquea para revisión. `relay_confirmed` significa que el firmware informó el pulso; **no demuestra que la máquina otorgó crédito**.
 - Sesiones de Supabase verificadas en el backend; empresa y rol salen de `app_metadata` administrado por el servidor. No hay clave compartida dentro del frontend.
 - Simuladores solo en entorno no productivo, con autenticación y habilitación explícita. Usan la misma transacción que pagos; no llaman a Mercado Pago.
-- TLS verificado en firmware, clave WiFi propia por dispositivo, portal restringido a su red de configuración y operaciones locales protegidas. Consumo antiguo retirado con HTTP 426.
+- Firmware NodeMCU completo con TLS, portal local PaySync, contraseña técnica individual, captura de efectivo por interrupción y cola persistente. `/device/consume-pulse` admite POST `ack-v1` con confirmación; el consumo antiguo sin ese protocolo devuelve HTTP 426.
 - `.env` y `node_modules` dejan de versionarse. **La eliminación no revoca claves del historial anterior.**
 
 ## Ejecutar y verificar
@@ -33,6 +33,10 @@ La suite usa HTTP simulado y PostgreSQL embebido PGlite con el esquema históric
 
 - [Plan de puesta en marcha y pendientes](docs/PRODUCCION.md)
 - [Contrato para el panel Lovable](docs/API-PANEL.md)
-- [Migración aditiva](db/20260926_production_foundation.sql)
+- [Montaje en placa perforada](docs/HARDWARE-ESP8266.md)
+- [Generación, instalación y prueba del dispositivo](docs/INSTALACION-DISPOSITIVO.md)
+- [Firmware fuente](firmware/paysync-esp8266/PaySyncESP8266.ino)
+- [Primera migración](db/20260926_production_foundation.sql) y [segunda migración: dispositivo](db/20260926_esp8266_device.sql), en ese orden
+- [Resultados de pruebas](docs/VERIFICACION.md)
 
 El backend publicado seguía en la versión anterior al revisar este trabajo. Restaurar Supabase recuperó `/health` y `/debug/supabase` (HTTP 200, 13 dispositivos en el diagnóstico). Esto confirma recuperación del servicio antiguo, no la publicación ni certificación de esta rama.

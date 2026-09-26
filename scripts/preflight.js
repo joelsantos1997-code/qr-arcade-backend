@@ -1,5 +1,6 @@
 require('dotenv').config({quiet:true});
 const {createRuntime}=require('../lib/runtime');
+const {SCHEMA_VERSION}=require('../lib/device-protocol');
 const rt=createRuntime(process.env,fetch);
 (async()=>{
   const issues=rt.configIssues();
@@ -7,8 +8,8 @@ const rt=createRuntime(process.env,fetch);
   if(!rt.config.caPem.includes('-----BEGIN CERTIFICATE-----'))issues.push('FIRMWARE_CA_PEM: missing');
   try {
     const version=await rt.callRpc('paysync_schema_version');
-    console.log('Database schema: '+(version==='20260926'?'ready':'wrong version'));
-    if(version!=='20260926')issues.push('schema');
+    console.log('Database schema: '+(version===SCHEMA_VERSION?'ready':'wrong version'));
+    if(version!==SCHEMA_VERSION)issues.push('schema');
   }catch{console.log('Database schema: unavailable');issues.push('schema');}
   try {
     const me=await rt.mercadoPagoRequest('/users/me');

@@ -10,6 +10,7 @@ before(async()=>{
   db=new PGlite();
   await db.exec(fs.readFileSync(path.join(__dirname,'fixtures/legacy-schema.sql'),'utf8'));
   await db.exec(fs.readFileSync(path.join(__dirname,'../db/20260926_production_foundation.sql'),'utf8'));
+  await db.exec(fs.readFileSync(path.join(__dirname,'../db/20260926_esp8266_device.sql'),'utf8'));
 });
 after(async()=>{await db?.close();});
 beforeEach(async()=>{
@@ -25,7 +26,64 @@ async function rpc(name,args=[]) {
 const prepare=(kind='qr')=>rpc('paysync_prepare_order',[kind,kind==='company_plan'?null:'PS-000004',cid,kind==='qr'?null:'monthly',5000]);
 const claim=(boot='boot-original')=>rpc('paysync_claim_coin',['PS-000004','fixture-device-token',boot]);
 const ack=(id,outcome='relay_sent')=>rpc('paysync_ack_coin',['PS-000004','fixture-device-token',id,outcome]);
-test('database migration and read-only version probe succeed',async()=>{assert.equal(await rpc('paysync_schema_version'),'20260926');});
+test('database migration and read-only version probe succeed',async()=>{assert.equal(await rpc('paysync_schema_version'),'20260926-device-v1');});
+
+test('new polls renew a stale lease, require commissioning and refuse maintenance delivery',async()=>{
+  const order=await prepare();await rpc('paysync_apply_payment',[order.id,'mp-poll',150]);
+  await db.exec("update paysync_runtime set last_seen_at=now()-interval '1 hour',commissioned=false");
+  const poll=(ready=true)=>rpc('paysync_poll_coin',['PS-000004','fixture-device-token','boot-original',ready]);
+  assert.equal((await poll()).command,null);
+  await db.exec('update paysync_runtime set commissioned=true');
+  assert.equal((await poll(false)).command,null);assert.ok((await poll()).command.id);
+  assert.equal((await rpc('paysync_poll_coin',['PS-000004','fixture-device-token','different-boot',true])).command,null);
+});
+
+test('telemetry is authenticated, durable and cannot advertise ready during maintenance',async()=>{
+  const args=['PS-000004','fixture-device-token','boot-original',true,123456,32000,3,'storage_failure',true];
+  const r=await rpc('paysync_device_telemetry',args);assert.equal(r.ready,false);
+  const row=(await db.query('select ready,maintenance,free_heap,pending_events,last_error,last_error_at from paysync_runtime')).rows[0];
+  assert.equal(row.maintenance,true);assert.equal(row.free_heap,32000);assert.ok(row.last_error_at);
+  await assert.rejects(rpc('paysync_device_telemetry',args.map((v,i)=>i===1?null:v)),/Invalid device/);
+  await assert.rejects(rpc('paysync_device_telemetry',args.map((v,i)=>i===6?129:v)),/Invalid telemetry/);
+});
+
+const deviceEvent=(uid,kind='billetero',amount=1000,company=cid)=>rpc('paysync_record_device_event',['PS-000004','fixture-device-token',uid,company,kind,amount,'fixture']);
+test('offline cash retries are atomic, retain snapshot amount and reject event identity conflicts',async()=>{
+  const results=await Promise.all([deviceEvent('event-cash-001'),deviceEvent('event-cash-001')]);
+  assert.equal(results.filter(r=>r.duplicate).length,1);
+  await db.exec('update devices set bill_pulse_value_ars=9999');
+  assert.equal((await deviceEvent('event-cash-001')).amount_ars,1000);
+  assert.equal((await deviceEvent('event-cash-001','billetero',2000)).error,'event_conflict');
+  assert.equal((await deviceEvent('event-cash-001','monedero')).error,'event_conflict');
+  assert.equal((await db.query('select count(*)::int as n from income_events')).rows[0].n,1);
+  await db.exec('update devices set company_id=null');
+  assert.equal((await deviceEvent('event-cash-001')).duplicate,true);
+  assert.equal((await deviceEvent('event-cash-002')).error,'company_changed');
+});
+
+test('collection retries create one collection and preserve the cash queue boundary',async()=>{
+  await deviceEvent('event-cash-001');await deviceEvent('event-coin-001','monedero',100);
+  const first=await deviceEvent('event-collect-001','collection',0);
+  assert.equal(first.total_amount_ars,1100);assert.equal(first.recorded,true);
+  assert.equal((await deviceEvent('event-collect-001','collection',0)).collection_id,first.collection_id);
+  await deviceEvent('event-cash-002');
+  const second=await deviceEvent('event-collect-002','collection',0);assert.equal(second.total_amount_ars,1000);
+  assert.equal((await db.query('select count(*)::int as n from collections')).rows[0].n,2);
+});
+
+test('new cash RPC and event table cannot be invoked by browser roles',async()=>{
+  const row=(await db.query("select has_function_privilege('anon','paysync_record_device_event(text,text,text,uuid,text,integer,text)','execute') as anon, has_table_privilege('authenticated','paysync_device_events','select') as browser")).rows[0];
+  assert.deepEqual(row,{anon:false,browser:false});
+  await assert.rejects(rpc('paysync_record_device_event',['PS-000004',null,'event-cash-001',cid,'billetero',1000,null]),/Invalid device/);
+});
+
+test('collection never transfers uncollected income from a previous company',async()=>{
+  await deviceEvent('event-old-company');
+  const other='10000000-0000-4000-8000-000000000002';
+  await db.exec(`insert into companies(id,name) values('${other}','Second company'); update devices set company_id='${other}'`);
+  const r=await deviceEvent('event-new-collect','collection',0,other);assert.equal(r.total_amount_ars,0);
+  assert.equal((await deviceEvent('event-old-company')).duplicate,true);
+});
 
 test('missing device credentials, boot identity and receipt outcome cannot bypass SQL checks',async()=>{
   for(const token of [null,'','wrong']) {

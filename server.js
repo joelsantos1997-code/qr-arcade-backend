@@ -3,7 +3,8 @@ const {createRuntime} = require("./lib/runtime");
 const {installSecurity} = require("./lib/security");
 const {installStatus} = require("./lib/status");
 const {installPayments} = require("./lib/payments");
-const {generateEspFirmware} = require("./lib/firmware");
+const {generateEspFirmware,technicalPassword} = require("./lib/firmware");
+const {runtimeParams,recordDeviceEvent} = require("./lib/device-protocol");
 
 function createApp({env=process.env,fetchImpl=globalThis.fetch}={}) {
 const app=express();
@@ -147,6 +148,21 @@ async function heartbeatHandler(req, res) {
       wifiRssi = parseInt(rssiRaw, 10);
     }
 
+    let runtime=null;
+    if (getParam(req,["protocol"]) === "ack-v1") {
+      const params=runtimeParams(req,rt);
+      if(getParam(req,['uptime_ms'])!==null) {
+        const telemetry={uptime_ms:[0,Number.MAX_SAFE_INTEGER],free_heap:[0,200000],pending_events:[0,128]};
+        for(const [name,[min,max]] of Object.entries(telemetry)) {
+          const value=getParam(req,[name]);
+          if(!Number.isSafeInteger(value) || value<min || value>max) throw rt.httpError(400,'Invalid telemetry: '+name);
+          params['p_'+name]=value;
+        }
+        params.p_last_error=getParam(req,['last_error']);params.p_maintenance=getParam(req,['maintenance']);
+        if(!/^[a-z_]{1,48}$/.test(params.p_last_error || '') || typeof params.p_maintenance!=='boolean') throw rt.httpError(400,'Invalid device diagnostics');
+        runtime=await callRpc('paysync_device_telemetry',params);
+      } else runtime=await callRpc('paysync_heartbeat',params);
+    }
     const data = await callRpc("device_heartbeat_by_device_code", {
       p_device_code: deviceCode,
       p_device_token: deviceToken,
@@ -154,9 +170,7 @@ async function heartbeatHandler(req, res) {
       p_firmware_version: firmware
     });
 
-    if (getParam(req,["protocol"]) === "ack-v1") {
-      await callRpc("paysync_heartbeat",{p_device_code:deviceCode,p_device_token:deviceToken,p_boot_id:getParam(req,["boot_id"]),p_ready:getParam(req,["ready"]) === true});
-    }
+    if(runtime) return res.json({ok:true,data,protocol:'ack-v1',runtime});
     return ok(res, data);
   } catch (error) {
     return fail(res, error);
@@ -168,6 +182,7 @@ app.post("/device/heartbeat", heartbeatHandler);
 
 async function billPulseHandler(req, res) {
   try {
+    if(getParam(req,['protocol'])==='ack-v1') return await recordDeviceEvent(req,res,rt,'cash');
     const deviceCode = getParam(req, ["device", "device_code"]);
     const deviceToken = getParam(req, ["token", "device_token"]);
     let eventUid = getParam(req, ["event_uid", "event"]);
@@ -200,7 +215,13 @@ async function billPulseHandler(req, res) {
 app.get("/device/bill-pulse", billPulseHandler);
 app.post("/device/bill-pulse", billPulseHandler);
 
-app.all("/device/consume-pulse",(req,res)=>res.status(426).json({ok:false,error:"Firmware ack-v1 required; legacy credits need reconciliation"}));
+app.all("/device/consume-pulse",async(req,res)=>{
+  try {
+    if(req.method!=='POST' || getParam(req,['protocol'])!=='ack-v1') return res.status(426).json({ok:false,error:'Firmware ack-v1 required; legacy credits need reconciliation'});
+    const data=await callRpc('paysync_poll_coin',runtimeParams(req,rt));
+    return res.json({ok:true,protocol:'ack-v1',data});
+  }catch(e){return fail(res,e);}
+});
 
 app.get("/device/live-status", async function (req, res) {
   try {
@@ -238,6 +259,7 @@ app.get("/device/summary", async function (req, res) {
 
 async function registerCollectionHandler(req, res) {
   try {
+    if(getParam(req,['protocol'])==='ack-v1') return await recordDeviceEvent(req,res,rt,'collection');
     const deviceCode = getParam(req, ["device", "device_code"]);
     const deviceToken = getParam(req, ["token", "device_token"]);
     const notes = getParam(
@@ -711,7 +733,8 @@ app.get("/admin/firmware", async function (req, res) {
             "<div class='grid'>" +
               "<div class='card'><div class='label'>Dispositivo</div><div class='value'>" + escapeHtml(device.device_code) + "</div></div>" +
               "<div class='card'><div class='label'>Nombre</div><div class='value'>" + escapeHtml(device.visible_name) + "</div></div>" +
-              "<div class='card'><div class='label'>Token secreto</div><div class='value'>" + escapeHtml(device.device_token) + "</div></div>" +
+              "<div class='card'><div class='label'>Modo tecnico: usuario tecnico</div><div class='value'>" + escapeHtml(technicalPassword(device.device_token)) + "</div></div>" +
+              "<div class='card'><div class='label'>WiFi local</div><div class='value'>PaySync-" + escapeHtml(device.device_code.slice(3)) + " / PSync1234 / 192.168.4.1</div></div>" +
               "<div class='card'><div class='label'>Precio QR</div><div class='value'>$" + escapeHtml(device.qr_price_ars) + "</div></div>" +
             "</div>" +
             "<div class='actions'>" +
